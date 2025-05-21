@@ -513,8 +513,281 @@ weather_df_pl = pl.from_pandas(weather_df)
 # %%
 # ***************************************** MERGE ALL DATASETS ************************************************
 
+# # Names of day-ahead forecast variables
+# da_forecast_names = ["Load_DA", "Solar_DA", "WindOn_DA", "WindOff_DA"]
+
+# # Names of fuel variables
+# fuel_names = ["Coal", "NGas", "Oil", "EUA"]
+
 merged_data = (
     ds_price_pl
     .join(ds_load_pl, on=["MapCode", "time_utc"], how="left")
     .join(ds_generation_pl, on=["MapCode", "time_utc"], how="left")
 )
+
+merged_data = (
+    merged_data
+    .join(df_wide_streamtable_pl, on=["time_utc"], how="left")
+)
+
+data = merged_data.to_pandas()
+data.rename(columns={
+        "Wind_Onshore_DA": "WindOn_DA",
+        "Wind_Offshore_DA": "WindOff_DA",
+        "coal_fM_01": "Coal",
+        "gas_fM_01": "NGas",
+        "oil_fM_01": "Oil",
+        "EUA_fM_01": "EUA"
+    }, inplace=True)
+
+#%% test for one
+data = data.loc[data["MapCode"] == "NO1", data.columns != "MapCode"]
+
+# Convert the 'time_utc' column to timezone-aware datetime objects (in UTC) using the specified format
+time_utc = pd.to_datetime(data["time_utc"],
+                          utc=True, format="%Y-%m-%d %H:%M:%S")
+
+# convert time_utc to local time
+local_time_zone = "CET"  # local time zone abbrv
+time_lt = time_utc.dt.tz_convert(local_time_zone)
+time_lt
+
+S = 24
+
+#%% Save the start and end-time
+start_end_time_S = time_lt.iloc[[0, -1]].dt.tz_localize(None).dt.tz_localize("UTC")
+
+# creating 'fake' local time
+start_end_time_S_num = pd.to_numeric(start_end_time_S)
+time_S_numeric = np.arange(
+    start=start_end_time_S_num.iloc[0],
+    stop=start_end_time_S_num.iloc[1] + 24 * 60 * 60 * 10**9 / S,
+    step=24 * 60 * 60 * 10**9 / S,
+)
+
+#  'fake' local time
+time_S = pd.Series(pd.to_datetime(time_S_numeric, utc=True))
+dates_S = pd.Series(time_S.dt.date.unique())
+
+
+#%% import DST_trafo function and use it on data
+data_array = DST_trafo(X=data.iloc[:, 1:], Xtime=time_utc, tz=local_time_zone)
+type(data_array)
+print(f"original data has: {data.shape} (including time_utc), and then after DST we have: {data_array.shape}")
+
+ 
+#%% Change data_array to tensor
+data_array= torch.tensor(data_array, dtype=torch.float64, device=device)
+
+# save the prices as dataframe
+price_S = data_array[..., 0]
+
+# Keep the last 2 years for test
+N = 2 * 365
+dat_eval = data_array[:-N,:,:]
+days_eval = pd.to_datetime(dates_S)[:-N]
+
+Price_eval = price_S[:-N]
+
+
+#%%###########################################################################
+####################function for forecats#################################
+##########################################################################
+# Define the validation period length
+length_eval = 2 * 365
+
+# The first obdervation in the evaluation period
+begin_eval = dat_eval.shape[0] - length_eval
+
+
+N_s= length_eval
+
+D=730
+
+# Specify the weekday dummies: Mon, Sat, and Sun 
+wd = [1, 6, 7]
+
+#Specify the lags: lag 1 , lag 2 and lag 7
+price_s_lags = [1, 2,7]
+
+#Specify lags of DA: predictions of tomorrow 
+da_lag=[0]
+
+
+
+#%%
+from sklearn.linear_model import LinearRegression
+from calendar import day_abbr
+#set the GPU
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def forecast_expert_ext_fuelLag2(
+    dat, days, reg_names, wd, price_s_lags, fuel_lags=[2]
+):
+     # Number of hours in a day 
+    S = dat.shape[1]  # number of hours
+
+    # Initialize forecast tensor with NaNs for each hour
+    forecast = torch.full((S,), float('nan'), device=device)
+
+    # Convert weekday dates to numeric values (1 = Monday, ..., 7 = Sunday)
+    weekdays_num = torch.tensor(days.dt.weekday.values + 1, device=device)
+    # Create weekday dummy variables for specified weekdays in `wd`
+    WD = torch.stack([(weekdays_num == x).float() for x in wd], dim=1)
+
+    # Names of day-ahead forecast variables
+    da_forecast_names = ["Load_DA", "Solar_DA", "WindOn_DA", "WindOff_DA"]
+    
+    # Names of fuel variables
+    fuel_names = ["Coal", "NGas", "Oil", "EUA"]
+
+    # Get column indices for fuels and DA variables
+    reg_names = list(reg_names)
+    fuel_idx = torch.tensor([reg_names.index(name) for name in fuel_names], device=device)
+    price_idx = reg_names.index("Price")
+    da_idx = torch.tensor([reg_names.index(name) for name in da_forecast_names], device=device)
+
+    # Helper function to create 1D lagged tensor
+    def get_lagged(Z, lag):
+        if lag == 0:
+           return Z
+        return torch.cat([torch.full((lag,), float('nan'), device=Z.device), Z[:-lag]])
+
+    # Helper function to create 2D lagged tensor (for multivariate lags)
+    def get_lagged_2d(Z, lag):
+        if lag == 0:
+           return Z
+        return torch.cat([torch.full((lag, Z.shape[1]), float('nan'), device=Z.device), Z[:-lag]], dim=0)
+
+    # Create lagged fuel variables for all specified lags and concatenate them
+    mat_fuels = torch.cat(
+        [get_lagged_2d(dat[:, 0, fuel_idx], lag=l) for l in fuel_lags], dim=1
+    )
+
+    # Lagged price from the last hour of the previous day
+    price_last = get_lagged(dat[:, S - 1, price_idx], lag=1)
+
+    # Container for coefficients
+    num_features = len(wd) + len(price_s_lags) + len(fuel_names)*len(fuel_lags) + len(da_forecast_names)*len(da_lag) + 1
+    coefs = torch.full((S, num_features), float('nan'), device=device)
+     
+     # Loop over each hour of the day to fit a separate regression model 
+    for s in range(S):
+         # Actual price (target variable) at hour s
+        acty = dat[:, s, price_idx]
+
+         # Lagged values of the current hour's price
+        mat_price_lags = torch.stack([get_lagged(acty, lag) for lag in price_s_lags], dim=1)
+
+        # Day-ahead forecast values at hour s
+        mat_da_forecasts = dat[:, s, da_idx]
+        
+         # Create lags for each day-ahead forecast variable
+        da_lagged_list = [
+            torch.stack([get_lagged(mat_da_forecasts[:, i], lag) for lag in da_lag], dim=1)
+            for i in range(len(da_forecast_names))
+        ]
+         # Combine all lagged day-ahead forecasts into one matrix
+        da_all_var = torch.cat(da_lagged_list, dim=1)
+
+        # Build the design matrix for regression
+        if s == S - 1:
+            # For last hour, exclude "Price last" predictor
+            regmat = torch.cat(
+                [acty.unsqueeze(1), mat_price_lags, da_all_var, WD, mat_fuels], dim=1
+                )
+        else:
+            # For all other hours, include "Price last"
+            regmat = torch.cat(
+                [acty.unsqueeze(1), mat_price_lags, da_all_var, WD, mat_fuels, price_last.unsqueeze(1)], dim=1
+                )
+
+        # Filter out rows with missing data
+        nan_mask = ~torch.any(torch.isnan(regmat), dim=1)
+        regmat0 = regmat[nan_mask]
+
+
+
+         # Standardize the data using mean and std of training part
+        Xy = regmat0
+        mean = Xy[:-1].mean(dim=0)
+        std = Xy[:-1].std(dim=0)
+        std[std == 0] = 1 # Prevent division by zero
+        Xy_scaled = (Xy - mean) / std
+          
+        # Training data
+        X = Xy_scaled[:-1, 1:].cpu().numpy()
+        y = Xy_scaled[:-1, 0].cpu().numpy()
+        x_pred = Xy_scaled[-1, 1:].cpu().numpy()
+        
+        # Fit linear regression model
+        model = LinearRegression(fit_intercept=False)
+        model.fit(X, y)
+        
+        # Convert coefficients to tensor and clean NaNs
+        coef = torch.tensor(model.coef_, dtype=torch.float32, device=device)
+        coef[coef != coef] = 0  # Replace NaNs with 0
+
+         # Compute the forecast (re-scale to original units)
+        forecast[s] = (coef @ torch.tensor(x_pred, dtype=torch.float32, device=device)) * std[0] + mean[0]
+
+        # Save coefficients
+        if s == S - 1:
+            coefs[s] = torch.cat([coef, torch.tensor([0.0], device=device)])
+        else:
+            coefs[s, :coef.numel()] = coef
+
+    # Build coefficient dataframe
+    regressor_names = (
+        [f"Price lag {lag}" for lag in price_s_lags] +
+        [f"{name}_lag_{lag}_s{s}" for name in da_forecast_names for lag in da_lag] +
+        [day_abbr[i - 1] for i in wd] +
+        [f"{fuel} lag {lag}" for lag in fuel_lags for fuel in fuel_names] +
+        ["Price last lag 1"]
+    )
+    # Convert coefficients to pandas DataFrame for inspection
+    coefs_df = pd.DataFrame(coefs.cpu().numpy(), columns=regressor_names)
+    
+    # Return forecast and coefficients
+    return {"forecasts": forecast, "coefficients": coefs_df}
+
+
+#%%####################################################################
+######################## Forecasting Study  for the Evaluation data####
+#######################################################################
+
+# List of model names 
+model_names = [
+    "true",
+    "expert_ext"
+]
+
+# Total number of models
+n_models = len(model_names)
+
+# Initialize a 3D tensor to hold forecasts:
+forecasts = torch.full((N_s, S, n_models), float('nan'), dtype=torch.float64, device=device)
+
+# Loop over each forecasting step
+for n in range(N_s):
+    # Save the actual ("true") prices for evaluation
+    forecasts[n, :, 0] = price_S[begin_eval+n]
+
+      # Select the date range for the current window (D days of history + current day)
+    days = pd.to_datetime(dates_S[(begin_eval - D + n) : (begin_eval + 1+ n)])
+
+    # Generate forecasts using expert_ext model and save them
+    forecasts[n, :, 1] = forecast_expert_ext_fuelLag2(
+        dat=data_array[(begin_eval - D + n) : (begin_eval + 1 + n)], 
+        days=days, 
+        reg_names=data.columns[1:],
+        wd=wd, 
+        price_s_lags=price_s_lags,
+        fuel_lags=[2]
+    )["forecasts"]
+
+     # Progress tracker (as percentage)
+    progress = torch.tensor((n + 1) / N * 100, dtype=torch.float64)
+    print(f"\r-> {progress.item():.2f}% done", end="")
+
+
