@@ -6,15 +6,26 @@ import numpy as np
 from tutorials.my_functions import DST_trafo, forecast_expert_ext
 import polars as pl
 import matplotlib.pyplot as plt
-
 import optuna
 import requests
-
 import torch
 import random
 from sqlalchemy import create_engine,inspect
 from pathlib import Path
 import urllib.parse
+
+#%%
+import importlib
+import tutorials.my_functions as my_functions
+
+# Reload the module to get the latest version of functions
+importlib.reload(my_functions)
+
+# Access the functions from the reloaded module
+DST_trafo = my_functions.DST_trafo
+forecast_expert_ext = my_functions.forecast_expert_ext
+
+#%%
 
 #set the GPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -169,7 +180,6 @@ value_cols = [col for col in ds_generation_pl.columns if col not in ["MapCode", 
 
 # Apply groupby and custom aggregation
 ds_generation_pl = (
-
     ds_generation_pl
     .group_by(["MapCode", "time_utc"])
     .agg([
@@ -446,7 +456,23 @@ rename_map = {
     'Date': 'time_utc'
 }
 df_wide_streamtable.rename(columns=rename_map, inplace=True)
+
+# use obs per day to get the same obs per hour and per day
+len_wide_stream = len(df_wide_streamtable)
+# Repeat each row 24 times
+df_wide_streamtable = df_wide_streamtable.loc[df_wide_streamtable.index.repeat(24)].copy()
+
+# Create hour range (0 to 23) and assign to a new 'hour' column
+df_wide_streamtable['hour'] = list(np.tile(np.arange(24), len_wide_stream ))
+
+# Add hours to the date to get full datetime
+df_wide_streamtable['time_utc'] = df_wide_streamtable['time_utc'] + pd.to_timedelta(df_wide_streamtable['hour'], unit='h')
+
+# Drop helper column if not needed
+df_wide_streamtable.drop(columns='hour', inplace=True)
+
 df_wide_streamtable_pl = pl.from_pandas(df_wide_streamtable)
+
 
 #%% 
 #######################################################################
@@ -515,7 +541,6 @@ weather_df_pl = pl.from_pandas(weather_df)
 
 # # Names of day-ahead forecast variables
 # da_forecast_names = ["Load_DA", "Solar_DA", "WindOn_DA", "WindOff_DA"]
-
 # # Names of fuel variables
 # fuel_names = ["Coal", "NGas", "Oil", "EUA"]
 
@@ -531,17 +556,30 @@ merged_data = (
 )
 
 data = merged_data.to_pandas()
+
+# fill misisng values of weekend usin the last value (friday)
+cols_to_fill = ['EUA_fM_01', 'USD_EUR', 'coal_fM_01', 'gas_fM_01', 'oil_fM_01',
+                'oil_fM_01_EUR', 'coal_fM_01_EUR',
+                'Wind_Offshore_DA', 'Wind_Onshore_DA']
+data[cols_to_fill] = data.groupby("MapCode")[cols_to_fill].transform('ffill')
+
 data.rename(columns={
         "Wind_Onshore_DA": "WindOn_DA",
         "Wind_Offshore_DA": "WindOff_DA",
-        "coal_fM_01": "Coal",
+        "coal_fM_01_EUR": "Coal",
         "gas_fM_01": "NGas",
-        "oil_fM_01": "Oil",
+        "oil_fM_01_EUR": "Oil",
         "EUA_fM_01": "EUA"
     }, inplace=True)
 
 #%% test for one
 data = data.loc[data["MapCode"] == "NO1", data.columns != "MapCode"]
+
+# include variables to train the model
+ls_regressors_target = ['time_utc', 'Price', 
+                 'Load_A', 'Load_DA', "WindOn_DA", "WindOff_DA", 'Solar_DA',
+                 "Coal", "NGas", "Oil", "EUA"]
+data = data[ls_regressors_target]
 
 # Convert the 'time_utc' column to timezone-aware datetime objects (in UTC) using the specified format
 time_utc = pd.to_datetime(data["time_utc"],
@@ -599,7 +637,6 @@ length_eval = 2 * 365
 # The first obdervation in the evaluation period
 begin_eval = dat_eval.shape[0] - length_eval
 
-
 N_s= length_eval
 
 D=730
@@ -616,140 +653,15 @@ da_lag=[0]
 
 
 #%%
-from sklearn.linear_model import LinearRegression
-from calendar import day_abbr
-#set the GPU
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+import importlib
+import tutorials.my_functions as my_functions
 
-def forecast_expert_ext_fuelLag2(
-    dat, days, reg_names, wd, price_s_lags, fuel_lags=[2]
-):
-     # Number of hours in a day 
-    S = dat.shape[1]  # number of hours
+# Reload the module to get the latest version of functions
+importlib.reload(my_functions)
 
-    # Initialize forecast tensor with NaNs for each hour
-    forecast = torch.full((S,), float('nan'), device=device)
-
-    # Convert weekday dates to numeric values (1 = Monday, ..., 7 = Sunday)
-    weekdays_num = torch.tensor(days.dt.weekday.values + 1, device=device)
-    # Create weekday dummy variables for specified weekdays in `wd`
-    WD = torch.stack([(weekdays_num == x).float() for x in wd], dim=1)
-
-    # Names of day-ahead forecast variables
-    da_forecast_names = ["Load_DA", "Solar_DA", "WindOn_DA", "WindOff_DA"]
-    
-    # Names of fuel variables
-    fuel_names = ["Coal", "NGas", "Oil", "EUA"]
-
-    # Get column indices for fuels and DA variables
-    reg_names = list(reg_names)
-    fuel_idx = torch.tensor([reg_names.index(name) for name in fuel_names], device=device)
-    price_idx = reg_names.index("Price")
-    da_idx = torch.tensor([reg_names.index(name) for name in da_forecast_names], device=device)
-
-    # Helper function to create 1D lagged tensor
-    def get_lagged(Z, lag):
-        if lag == 0:
-           return Z
-        return torch.cat([torch.full((lag,), float('nan'), device=Z.device), Z[:-lag]])
-
-    # Helper function to create 2D lagged tensor (for multivariate lags)
-    def get_lagged_2d(Z, lag):
-        if lag == 0:
-           return Z
-        return torch.cat([torch.full((lag, Z.shape[1]), float('nan'), device=Z.device), Z[:-lag]], dim=0)
-
-    # Create lagged fuel variables for all specified lags and concatenate them
-    mat_fuels = torch.cat(
-        [get_lagged_2d(dat[:, 0, fuel_idx], lag=l) for l in fuel_lags], dim=1
-    )
-
-    # Lagged price from the last hour of the previous day
-    price_last = get_lagged(dat[:, S - 1, price_idx], lag=1)
-
-    # Container for coefficients
-    num_features = len(wd) + len(price_s_lags) + len(fuel_names)*len(fuel_lags) + len(da_forecast_names)*len(da_lag) + 1
-    coefs = torch.full((S, num_features), float('nan'), device=device)
-     
-     # Loop over each hour of the day to fit a separate regression model 
-    for s in range(S):
-         # Actual price (target variable) at hour s
-        acty = dat[:, s, price_idx]
-
-         # Lagged values of the current hour's price
-        mat_price_lags = torch.stack([get_lagged(acty, lag) for lag in price_s_lags], dim=1)
-
-        # Day-ahead forecast values at hour s
-        mat_da_forecasts = dat[:, s, da_idx]
-        
-         # Create lags for each day-ahead forecast variable
-        da_lagged_list = [
-            torch.stack([get_lagged(mat_da_forecasts[:, i], lag) for lag in da_lag], dim=1)
-            for i in range(len(da_forecast_names))
-        ]
-         # Combine all lagged day-ahead forecasts into one matrix
-        da_all_var = torch.cat(da_lagged_list, dim=1)
-
-        # Build the design matrix for regression
-        if s == S - 1:
-            # For last hour, exclude "Price last" predictor
-            regmat = torch.cat(
-                [acty.unsqueeze(1), mat_price_lags, da_all_var, WD, mat_fuels], dim=1
-                )
-        else:
-            # For all other hours, include "Price last"
-            regmat = torch.cat(
-                [acty.unsqueeze(1), mat_price_lags, da_all_var, WD, mat_fuels, price_last.unsqueeze(1)], dim=1
-                )
-
-        # Filter out rows with missing data
-        nan_mask = ~torch.any(torch.isnan(regmat), dim=1)
-        regmat0 = regmat[nan_mask]
-
-
-
-         # Standardize the data using mean and std of training part
-        Xy = regmat0
-        mean = Xy[:-1].mean(dim=0)
-        std = Xy[:-1].std(dim=0)
-        std[std == 0] = 1 # Prevent division by zero
-        Xy_scaled = (Xy - mean) / std
-          
-        # Training data
-        X = Xy_scaled[:-1, 1:].cpu().numpy()
-        y = Xy_scaled[:-1, 0].cpu().numpy()
-        x_pred = Xy_scaled[-1, 1:].cpu().numpy()
-        
-        # Fit linear regression model
-        model = LinearRegression(fit_intercept=False)
-        model.fit(X, y)
-        
-        # Convert coefficients to tensor and clean NaNs
-        coef = torch.tensor(model.coef_, dtype=torch.float32, device=device)
-        coef[coef != coef] = 0  # Replace NaNs with 0
-
-         # Compute the forecast (re-scale to original units)
-        forecast[s] = (coef @ torch.tensor(x_pred, dtype=torch.float32, device=device)) * std[0] + mean[0]
-
-        # Save coefficients
-        if s == S - 1:
-            coefs[s] = torch.cat([coef, torch.tensor([0.0], device=device)])
-        else:
-            coefs[s, :coef.numel()] = coef
-
-    # Build coefficient dataframe
-    regressor_names = (
-        [f"Price lag {lag}" for lag in price_s_lags] +
-        [f"{name}_lag_{lag}_s{s}" for name in da_forecast_names for lag in da_lag] +
-        [day_abbr[i - 1] for i in wd] +
-        [f"{fuel} lag {lag}" for lag in fuel_lags for fuel in fuel_names] +
-        ["Price last lag 1"]
-    )
-    # Convert coefficients to pandas DataFrame for inspection
-    coefs_df = pd.DataFrame(coefs.cpu().numpy(), columns=regressor_names)
-    
-    # Return forecast and coefficients
-    return {"forecasts": forecast, "coefficients": coefs_df}
+# Access the functions from the reloaded module
+DST_trafo = my_functions.DST_trafo
+forecast_expert_ext = my_functions.forecast_expert_ext
 
 
 #%%####################################################################
@@ -770,6 +682,8 @@ forecasts = torch.full((N_s, S, n_models), float('nan'), dtype=torch.float64, de
 
 # Loop over each forecasting step
 for n in range(N_s):
+
+    print(f"********************* START NS ... {n} ****************************************************")
     # Save the actual ("true") prices for evaluation
     forecasts[n, :, 0] = price_S[begin_eval+n]
 
@@ -777,17 +691,57 @@ for n in range(N_s):
     days = pd.to_datetime(dates_S[(begin_eval - D + n) : (begin_eval + 1+ n)])
 
     # Generate forecasts using expert_ext model and save them
-    forecasts[n, :, 1] = forecast_expert_ext_fuelLag2(
-        dat=data_array[(begin_eval - D + n) : (begin_eval + 1 + n)], 
-        days=days, 
-        reg_names=data.columns[1:],
-        wd=wd, 
-        price_s_lags=price_s_lags,
-        fuel_lags=[2]
-    )["forecasts"]
+    forecasts[n, :, 1] = forecast_expert_ext(
+        dat = data_array[(begin_eval - D + n) : (begin_eval + 1 + n)], 
+        days = days,
+        wd = wd,
+        price_s_lags = price_s_lags,
+        da_lag = da_lag,
+        reg_names = data.columns[1:],
+        fuel_lags = [2])["forecasts"]
 
      # Progress tracker (as percentage)
     progress = torch.tensor((n + 1) / N * 100, dtype=torch.float64)
     print(f"\r-> {progress.item():.2f}% done", end="")
 
+    print(f"\n********************* END NS.. {n} ****************************************************")
 
+
+# %%#####################################################################
+#######################Comparison Plots##################################
+#######################################################################
+
+#select the hour
+hour=14
+
+# Select the actual and forecasted prices for the specific hour
+true_values = forecasts[:, hour, 0].cpu().numpy()
+forecast_values = forecasts[:, hour, 1].cpu().numpy()
+
+
+#Specify the dates of the test data
+dates_x = days_eval[-N:]
+# Line plot comparison
+plt.figure(figsize=(10, 5))
+plt.plot(dates_x, true_values, label="True")
+plt.plot(dates_x, forecast_values, label="Forecast (Expert)", alpha=0.7, linewidth=2)
+plt.title(f"Forecast vs True Values at hour {hour} Across Test Data")
+plt.xlabel("Date")
+plt.ylabel("Price")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+#%%
+# Select observation index 
+obs=729
+plt.figure(figsize=(10, 4))
+plt.plot(forecasts[obs, :, 0].cpu().numpy(), label="True", linewidth=2)
+plt.plot(forecasts[obs, :, 1].cpu().numpy(), label="Expert Forecast", linestyle="--")
+plt.xlabel("Hours")
+plt.ylabel("Price")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
