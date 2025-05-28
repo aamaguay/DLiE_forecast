@@ -1,5 +1,6 @@
 # %% load packages
 import locale
+from math import pi
 import os
 import pandas as pd
 import numpy as np
@@ -13,6 +14,10 @@ import random
 from sqlalchemy import create_engine,inspect
 from pathlib import Path
 import urllib.parse
+from pygam import LinearGAM, s
+from datetime import datetime
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 #%%
 import importlib
@@ -24,6 +29,9 @@ importlib.reload(my_functions)
 # Access the functions from the reloaded module
 DST_trafo = my_functions.DST_trafo
 forecast_expert_ext = my_functions.forecast_expert_ext
+run_forecast_step = my_functions.run_forecast_step
+forecast_gam = my_functions.forecast_gam
+forecast_gam_whole_sample = my_functions.forecast_gam_whole_sample
 
 #%%
 #set the GPU
@@ -122,7 +130,8 @@ da_lag = [0]
 # List of model names 
 model_names = [
     "true",
-    "expert_ext"
+    "expert_ext",
+    "linar_gam"
 ]
 
 # Total number of models
@@ -131,18 +140,32 @@ n_models = len(model_names)
 # Initialize a 3D tensor to hold forecasts:
 forecasts = torch.full((N_s, S, n_models), float('nan'), dtype=torch.float64, device=device)
 
+#%%
+# run the process using a loop
+# Start timing
+init_time = datetime.now()
 # Loop over each forecasting step
-for n in range(N_s):
+for n in range(N_s)[:2]:
 
     print(f"********************* START NS ... {n} ****************************************************")
     # Save the actual ("true") prices for evaluation
     forecasts[n, :, 0] = price_S[begin_eval+n]
 
-      # Select the date range for the current window (D days of history + current day)
+    # Select the date range for the current window (D days of history + current day)
     days = pd.to_datetime(dates_S[(begin_eval - D + n) : (begin_eval + 1+ n)])
 
     # Generate forecasts using expert_ext model and save them
     forecasts[n, :, 1] = forecast_expert_ext(
+        dat = data_array[(begin_eval - D + n) : (begin_eval + 1 + n)], 
+        days = days,
+        wd = wd,
+        price_s_lags = price_s_lags,
+        da_lag = da_lag,
+        reg_names = data.columns[1:],
+        fuel_lags = [2])["forecasts"]
+
+    # Generate forecasts using one model for the whole dataset
+    forecasts[n, :, 2] = forecast_gam_whole_sample(
         dat = data_array[(begin_eval - D + n) : (begin_eval + 1 + n)], 
         days = days,
         wd = wd,
@@ -156,6 +179,76 @@ for n in range(N_s):
     print(f"\r-> {progress.item():.2f}% done", end="")
 
     print(f"\n********************* END NS.. {n} ****************************************************")
+
+# End timing
+end_time = datetime.now()
+
+# Compute duration
+duration = end_time - init_time
+duration_minutes = duration.total_seconds() / 60
+print(f"Training duration: {duration_minutes:.2f} minutes")
+
+
+#%%
+# run procrss using ThreadPoolExecutor
+# run process
+# Start timing
+init_time = datetime.now()
+
+# Allocate results container
+results = [None] * N_s
+
+# Create thread pool
+with ThreadPoolExecutor() as executor:
+    futures = [
+        executor.submit(
+            run_forecast_step,
+            n,
+            price_S,
+            data_array,
+            begin_eval,
+            D,
+            dates_S,
+            wd,
+            price_s_lags,
+            da_lag,
+            data.columns[1:],  # reg_names
+            data.columns[1:]   # data_columns
+        )
+        for n in range(N_s)
+    ]
+
+    for future in as_completed(futures):
+        try:
+            n, true_price, expert, gam = future.result()
+            forecasts[n, :, 0] = true_price
+            forecasts[n, :, 1] = torch.tensor(expert, dtype=forecasts.dtype, device=forecasts.device)
+            forecasts[n, :, 2] = torch.tensor(gam, dtype=forecasts.dtype, device=forecasts.device)
+        except Exception as e:
+            print(f"Thread crashed: {e}")
+
+# End timing
+end_time = datetime.now()
+duration_minutes = (end_time - init_time).total_seconds() / 60
+print(f"\nParallel training duration (threaded): {duration_minutes:.2f} minutes")
+
+#%%
+# estimate rmse for all models, validation dataset
+true_values = forecasts[:, :, 0] 
+
+# Add a new axis to true_values to allow broadcasting
+true_expanded = true_values.unsqueeze(-1) 
+
+# Repeat along last dim
+FFT = true_expanded.repeat(1, 1, forecasts.shape[2]) 
+squared_errors = (FFT - forecasts) ** 2  
+
+
+# Average squared error over all days and hours (dim=0 and dim=1)
+mse_per_model = squared_errors.mean(dim=(0, 1))
+
+# Take square root to get RMSE per model
+rmse_per_model = torch.sqrt(mse_per_model) 
 
 
 # %%#####################################################################
@@ -198,10 +291,12 @@ plt.tight_layout()
 plt.show()
 
 # %%
-# chart for validation data
+# chart for last obs. of the validation data
+last_obs = 200
 plt.figure(figsize=(10, 4))
-plt.plot(forecasts[:, :, 0].flatten().cpu().numpy()[-800:], label="True", linewidth=2)
-plt.plot(forecasts[:, :, 1].flatten().cpu().numpy()[-800:], label="Expert Forecast", linestyle="--")
+plt.plot(forecasts[:, :, 0].flatten().cpu().numpy()[-last_obs:], label="True", linewidth=2)
+plt.plot(forecasts[:, :, 1].flatten().cpu().numpy()[-last_obs:], label="Expert Forecast", linestyle="--")
+plt.plot(forecasts[:, :, 2].flatten().cpu().numpy()[-last_obs:], label="GAM", linestyle=":")
 plt.xlabel("Hours")
 plt.ylabel("Price")
 plt.legend()
@@ -209,6 +304,18 @@ plt.grid(True)
 plt.tight_layout()
 plt.show()
 
+
+# %%
+# chart for validation data
+plt.figure(figsize=(10, 4))
+plt.plot(forecasts[:, :, 0].flatten().cpu().numpy(), label="True", linewidth=2)
+plt.plot(forecasts[:, :, 1].flatten().cpu().numpy(), label="Expert Forecast", linestyle="--")
+plt.xlabel("Hours")
+plt.ylabel("Price")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
 
 #%%#######################################################
 ############## Test Data ###############
@@ -230,14 +337,14 @@ begin_test = days_test.shape[0] - length_test
 
 N_s = length_test
 
+# Initialize a 3D tensor to hold forecasts:
+forecasts_test = torch.full((N_s, S, n_models), float('nan'), dtype=torch.float64, device=device)
+
 
 #%%#####################################################
 ############################Forecats test##############
 #######################################################
-
-# Initialize a 3D tensor to hold forecasts:
-forecasts_test = torch.full((N_s, S, n_models), float('nan'), dtype=torch.float64, device=device)
-
+# using loop approach
 # Loop over each forecasting step
 for n in range(N_s):
 
@@ -267,17 +374,79 @@ for n in range(N_s):
     print(f"\n********************* END NS.. {n} ****************************************************")
 
 
+#%% 
+# run process using ThreadPoolExecutor approach
+# Start timing
+init_time = datetime.now()
+
+# Allocate results container
+results_test = [None] * N_s
+
+# Create thread pool
+with ThreadPoolExecutor() as executor:
+    futures_test = [
+        executor.submit(
+            run_forecast_step,
+            n,
+            price_S,
+            data_array,
+            begin_test,
+            D,
+            dates_S,
+            wd,
+            price_s_lags,
+            da_lag,
+            data.columns[1:],  # reg_names
+            data.columns[1:]   # data_columns
+        )
+        for n in range(N_s)
+    ]
+
+    for future in as_completed(futures_test):
+        try:
+            n, true_price, expert, gam = future.result()
+            forecasts_test[n, :, 0] = true_price
+            forecasts_test[n, :, 1] = torch.tensor(expert, dtype=forecasts.dtype, device=forecasts.device)
+            forecasts_test[n, :, 2] = torch.tensor(gam, dtype=forecasts.dtype, device=forecasts.device)
+        except Exception as e:
+            print(f"Thread crashed: {e}")
+
+# End timing
+end_time = datetime.now()
+duration_minutes = (end_time - init_time).total_seconds() / 60
+print(f"\nParallel training duration (threaded): {duration_minutes:.2f} minutes")
+
+#%%
+# estimate rmse for all models, test dataset
+true_values_test = forecasts_test[:, :, 0] 
+
+# Add a new axis to true_values to allow broadcasting
+true_expanded_test = true_values_test.unsqueeze(-1) 
+
+# Repeat along last dim
+FFT_test = true_expanded_test.repeat(1, 1, forecasts_test.shape[2]) 
+squared_errors_test = (FFT_test - forecasts_test) ** 2  
+
+# Get the mask of valid rows (no NaNs across any hour or model)
+valid_rows_mask = ~torch.isnan(squared_errors_test).any(dim=(1, 2)) 
+squared_errors_test = squared_errors_test[valid_rows_mask]
+
+# Average squared error over all days and hours (dim=0 and dim=1)
+mse_per_model_test = squared_errors_test.mean(dim=(0, 1))
+
+# Take square root to get RMSE per model
+rmse_per_model_test = torch.sqrt(mse_per_model_test) 
 
 # %%
-# chart for test data
+# chart for test data, last obs
+last_obs_ = 300
 plt.figure(figsize=(10, 4))
-plt.plot(forecasts_test[:, :, 0].flatten().cpu().numpy()[-800:], label="True", linewidth=2)
-plt.plot(forecasts_test[:, :, 1].flatten().cpu().numpy()[-800:], label="Expert Forecast", linestyle="--")
+plt.plot(forecasts_test[:, :, 0].flatten().cpu().numpy()[-last_obs_:], label="True", linewidth=2)
+plt.plot(forecasts_test[:, :, 1].flatten().cpu().numpy()[-last_obs_:], label="Expert Forecast", linestyle="--")
+plt.plot(forecasts_test[:, :, 2].flatten().cpu().numpy()[-last_obs_:], label="GAM", linestyle=":")
 plt.xlabel("Hours")
 plt.ylabel("Price")
 plt.legend()
 plt.grid(True)
 plt.tight_layout()
 plt.show()
-
-# %%
