@@ -1,10 +1,10 @@
-# %% load packages
+ # %% load packages
 import locale
 from math import pi
 import os
 import pandas as pd
 import numpy as np
-from tutorials.my_functions import DST_trafo, forecast_expert_ext
+from tutorials.my_functions import DST_trafo, forecast_expert_ext, run_forecast_step, forecast_gam, forecast_gam_whole_sample
 import polars as pl
 import matplotlib.pyplot as plt
 import optuna
@@ -18,9 +18,6 @@ from pygam import LinearGAM, s
 from datetime import datetime
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
-
-# some code goes here
 
 #%%
 import importlib
