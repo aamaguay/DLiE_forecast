@@ -4,7 +4,7 @@ from math import pi
 import os
 import pandas as pd
 import numpy as np
-from tutorials.my_functions import DST_trafo, forecast_expert_ext, run_forecast_step, forecast_gam, forecast_gam_whole_sample
+from tutorials.my_functions import DST_trafo, forecast_expert_ext, run_forecast_step, forecast_gam, forecast_gam_whole_sample, forecast_lgbm_whole_sample
 import polars as pl
 import matplotlib.pyplot as plt
 import optuna
@@ -32,6 +32,7 @@ forecast_expert_ext = my_functions.forecast_expert_ext
 run_forecast_step = my_functions.run_forecast_step
 forecast_gam = my_functions.forecast_gam
 forecast_gam_whole_sample = my_functions.forecast_gam_whole_sample
+forecast_lgbm_whole_sample = my_functions.forecast_lgbm_whole_sample
 
 #%%
 #set the GPU
@@ -131,7 +132,8 @@ da_lag = [0]
 model_names = [
     "true",
     "expert_ext",
-    "linar_gam"
+    "linar_gam",
+    "light_gbm"
 ]
 
 # Total number of models
@@ -145,7 +147,7 @@ forecasts = torch.full((N_s, S, n_models), float('nan'), dtype=torch.float64, de
 # Start timing
 init_time = datetime.now()
 # Loop over each forecasting step
-for n in range(N_s)[:2]:
+for n in range(N_s):
 
     print(f"********************* START NS ... {n} ****************************************************")
     # Save the actual ("true") prices for evaluation
@@ -173,7 +175,17 @@ for n in range(N_s)[:2]:
         da_lag = da_lag,
         reg_names = data.columns[1:],
         fuel_lags = [2])["forecasts"]
-
+    
+    # Generate ligtgbm forecasts using one model for the whole dataset
+    forecasts[n, :, 3] = forecast_lgbm_whole_sample(
+        dat = data_array[(begin_eval - D + n) : (begin_eval + 1 + n)], 
+        days = days,
+        wd = wd,
+        price_s_lags = price_s_lags,
+        da_lag = da_lag,
+        reg_names = data.columns[1:],
+        fuel_lags = [2])["forecasts"]
+    
      # Progress tracker (as percentage)
     progress = torch.tensor((n + 1) / N * 100, dtype=torch.float64)
     print(f"\r-> {progress.item():.2f}% done", end="")
@@ -220,10 +232,11 @@ with ThreadPoolExecutor() as executor:
 
     for future in as_completed(futures):
         try:
-            n, true_price, expert, gam = future.result()
+            n, true_price, expert, gam, lg_gbm = future.result()
             forecasts[n, :, 0] = true_price
             forecasts[n, :, 1] = torch.tensor(expert, dtype=forecasts.dtype, device=forecasts.device)
             forecasts[n, :, 2] = torch.tensor(gam, dtype=forecasts.dtype, device=forecasts.device)
+            forecasts[n, :, 3] = torch.tensor(lg_gbm, dtype=forecasts.dtype, device=forecasts.device)
         except Exception as e:
             print(f"Thread crashed: {e}")
 
