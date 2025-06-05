@@ -136,6 +136,7 @@ model_names = [
     "light_gbm"
 ]
 
+
 # Total number of models
 n_models = len(model_names)
 
@@ -143,65 +144,69 @@ n_models = len(model_names)
 forecasts = torch.full((N_s, S, n_models), float('nan'), dtype=torch.float64, device=device)
 
 #%%
+# -------------------------------------------------------------------------------------------------------------------------
+# this was the initial structure but it is not optimal, so i just commented this part of the code
 # run the process using a loop
 # Start timing
-init_time = datetime.now()
-# Loop over each forecasting step
-for n in range(N_s):
+# init_time = datetime.now()
+# # Loop over each forecasting step
+# for n in range(N_s)[:5]:
 
-    print(f"********************* START NS ... {n} ****************************************************")
-    # Save the actual ("true") prices for evaluation
-    forecasts[n, :, 0] = price_S[begin_eval+n]
+#     print(f"********************* START NS ... {n} ****************************************************")
+#     # Save the actual ("true") prices for evaluation
+#     forecasts[n, :, 0] = price_S[begin_eval+n]
 
-    # Select the date range for the current window (D days of history + current day)
-    days = pd.to_datetime(dates_S[(begin_eval - D + n) : (begin_eval + 1+ n)])
+#     # Select the date range for the current window (D days of history + current day)
+#     days = pd.to_datetime(dates_S[(begin_eval - D + n) : (begin_eval + 1+ n)])
 
-    # Generate forecasts using expert_ext model and save them
-    forecasts[n, :, 1] = forecast_expert_ext(
-        dat = data_array[(begin_eval - D + n) : (begin_eval + 1 + n)], 
-        days = days,
-        wd = wd,
-        price_s_lags = price_s_lags,
-        da_lag = da_lag,
-        reg_names = data.columns[1:],
-        fuel_lags = [2])["forecasts"]
+#     # Generate forecasts using expert_ext model and save them
+#     forecasts[n, :, 1] = forecast_expert_ext(
+#         dat = data_array[(begin_eval - D + n) : (begin_eval + 1 + n)], 
+#         days = days,
+#         wd = wd,
+#         price_s_lags = price_s_lags,
+#         da_lag = da_lag,
+#         reg_names = data.columns[1:],
+#         fuel_lags = [2])["forecasts"]
 
-    # Generate forecasts using one model for the whole dataset
-    forecasts[n, :, 2] = forecast_gam_whole_sample(
-        dat = data_array[(begin_eval - D + n) : (begin_eval + 1 + n)], 
-        days = days,
-        wd = wd,
-        price_s_lags = price_s_lags,
-        da_lag = da_lag,
-        reg_names = data.columns[1:],
-        fuel_lags = [2])["forecasts"]
-    
-    # Generate ligtgbm forecasts using one model for the whole dataset
-    forecasts[n, :, 3] = forecast_lgbm_whole_sample(
-        dat = data_array[(begin_eval - D + n) : (begin_eval + 1 + n)], 
-        days = days,
-        wd = wd,
-        price_s_lags = price_s_lags,
-        da_lag = da_lag,
-        reg_names = data.columns[1:],
-        fuel_lags = [2])["forecasts"]
-    
-     # Progress tracker (as percentage)
-    progress = torch.tensor((n + 1) / N * 100, dtype=torch.float64)
-    print(f"\r-> {progress.item():.2f}% done", end="")
+#     # Generate forecasts using one model for the whole batch
+#     forecasts[n, :, 2] = forecast_gam_whole_sample(
+#         dat = data_array[(begin_eval - D + n) : (begin_eval + 1 + n)], 
+#         days = days,
+#         wd = wd,
+#         price_s_lags = price_s_lags,
+#         da_lag = da_lag,
+#         reg_names = data.columns[1:],
+#         fuel_lags = [2])["forecasts"]
 
-    print(f"\n********************* END NS.. {n} ****************************************************")
+#     # Generate ligtgbm forecasts using one model for the whole batch
+#     forecasts[n, :, 3] = forecast_lgbm_whole_sample(
+#         dat = data_array[(begin_eval - D + n) : (begin_eval + 1 + n)], 
+#         days = days,
+#         wd = wd,
+#         price_s_lags = price_s_lags,
+#         da_lag = da_lag,
+#         reg_names = data.columns[1:],
+#         fuel_lags = [2])["forecasts"]
 
-# End timing
-end_time = datetime.now()
+#      # Progress tracker (as percentage)
+#     progress = torch.tensor((n + 1) / N * 100, dtype=torch.float64)
+#     print(f"\r-> {progress.item():.2f}% done", end="")
 
-# Compute duration
-duration = end_time - init_time
-duration_minutes = duration.total_seconds() / 60
-print(f"Training duration: {duration_minutes:.2f} minutes")
+#     print(f"\n********************* END NS.. {n} ****************************************************")
+
+# # End timing
+# end_time = datetime.now()
+
+# # Compute duration
+# duration = end_time - init_time
+# duration_minutes = duration.total_seconds() / 60
+# print(f"Training duration: {duration_minutes:.2f} minutes")
 
 
 #%%
+# --------------------------------------------------------------------------------------------------------------------------
+# more efficient and work better compared to the loop version
 # run procrss using ThreadPoolExecutor
 # run process
 # Start timing
@@ -246,6 +251,8 @@ duration_minutes = (end_time - init_time).total_seconds() / 60
 print(f"\nParallel training duration (threaded): {duration_minutes:.2f} minutes")
 
 #%%
+# -------------------------------------------------------------------------------------------------------------------------
+# estimate results using train and validation datasets
 # estimate rmse for all models, validation dataset
 true_values = forecasts[:, :, 0] 
 
@@ -262,19 +269,18 @@ mse_per_model = squared_errors.mean(dim=(0, 1))
 
 # Take square root to get RMSE per model
 rmse_per_model = torch.sqrt(mse_per_model) 
-
+print(rmse_per_model)
 
 # %%#####################################################################
 #######################Comparison Plots##################################
 #######################################################################
 
+# chart for a specific hour and days
 #select the hour, chart for a specific hour
 hour = 14
-
 # Select the actual and forecasted prices for the specific hour
 true_values = forecasts[:, hour, 0].cpu().numpy()
 forecast_values = forecasts[:, hour, 1].cpu().numpy()
-
 
 #Specify the dates of the test data
 dates_x = days_eval[-N:]
@@ -291,38 +297,28 @@ plt.tight_layout()
 plt.show()
 
 #%%
-# Select observation index, chart for one day 
-obs = 729
+# chart for the last days
+# Select last days, chart for one day 
+obs =  -15
 plt.figure(figsize=(10, 4))
-plt.plot(forecasts[obs, :, 0].cpu().numpy(), label="True", linewidth=2)
-plt.plot(forecasts[obs, :, 1].cpu().numpy(), label="Expert Forecast", linestyle="--")
+plt.plot(forecasts[obs:, :, 0].flatten().cpu().numpy(), label="True", linewidth=2)
+plt.plot(forecasts[obs:, :, 1].flatten().cpu().numpy(), label="Expert Forecast", linestyle="--")
+plt.plot(forecasts[obs:, :, 2].flatten().cpu().numpy(), label="GAM", linestyle=":")
+plt.plot(forecasts[obs:, :, 3].flatten().cpu().numpy(), label="light gbm", linestyle="--")
 plt.xlabel("Hours")
 plt.ylabel("Price")
 plt.legend()
 plt.grid(True)
 plt.tight_layout()
 plt.show()
-
-# %%
-# chart for last obs. of the validation data
-last_obs = 200
-plt.figure(figsize=(10, 4))
-plt.plot(forecasts[:, :, 0].flatten().cpu().numpy()[-last_obs:], label="True", linewidth=2)
-plt.plot(forecasts[:, :, 1].flatten().cpu().numpy()[-last_obs:], label="Expert Forecast", linestyle="--")
-plt.plot(forecasts[:, :, 2].flatten().cpu().numpy()[-last_obs:], label="GAM", linestyle=":")
-plt.xlabel("Hours")
-plt.ylabel("Price")
-plt.legend()
-plt.grid(True)
-plt.tight_layout()
-plt.show()
-
 
 # %%
 # chart for validation data
 plt.figure(figsize=(10, 4))
 plt.plot(forecasts[:, :, 0].flatten().cpu().numpy(), label="True", linewidth=2)
 plt.plot(forecasts[:, :, 1].flatten().cpu().numpy(), label="Expert Forecast", linestyle="--")
+plt.plot(forecasts[:, :, 2].flatten().cpu().numpy(), label="GAM", linestyle=":")
+plt.plot(forecasts[:, :, 3].flatten().cpu().numpy(), label="light gbm", linestyle="--")
 plt.xlabel("Hours")
 plt.ylabel("Price")
 plt.legend()
@@ -353,41 +349,44 @@ N_s = length_test
 # Initialize a 3D tensor to hold forecasts:
 forecasts_test = torch.full((N_s, S, n_models), float('nan'), dtype=torch.float64, device=device)
 
-
 #%%#####################################################
 ############################Forecats test##############
 #######################################################
+# -------------------------------------------------------------------------------------------------------------------------
+# this was the initial structure but it is not optimal, so i just commented this part of the code
 # using loop approach
 # Loop over each forecasting step
-for n in range(N_s):
+# for n in range(N_s):
 
-    print(f"********************* START NS ... {n} ****************************************************")
+#     print(f"********************* START NS ... {n} ****************************************************")
 
     
-    # Save the actual ("true") prices for comparison later
-    forecasts_test[n, :, 0] = price_S[begin_test+n]
+#     # Save the actual ("true") prices for comparison later
+#     forecasts_test[n, :, 0] = price_S[begin_test+n]
 
-    # Select the date range for the current window 
-    days = pd.to_datetime(dates_S[(begin_test - D + n) : (begin_test + 1+ n)])
+#     # Select the date range for the current window 
+#     days = pd.to_datetime(dates_S[(begin_test - D + n) : (begin_test + 1+ n)])
 
-    # Generate forecasts using expert_ext model and save them
-    forecasts_test[n, :, 1] = forecast_expert_ext(
-        dat=data_array[(begin_test - D + n) : (begin_test + 1 + n)], 
-        days=days, 
-        reg_names=data.columns[1:],
-        wd=wd, 
-        da_lag = da_lag,
-        price_s_lags=price_s_lags,
-        fuel_lags = [2]
-    )["forecasts"]
+#     # Generate forecasts using expert_ext model and save them
+#     forecasts_test[n, :, 1] = forecast_expert_ext(
+#         dat=data_array[(begin_test - D + n) : (begin_test + 1 + n)], 
+#         days=days, 
+#         reg_names=data.columns[1:],
+#         wd=wd, 
+#         da_lag = da_lag,
+#         price_s_lags=price_s_lags,
+#         fuel_lags = [2]
+#     )["forecasts"]
 
-     # Progress tracker (as percentage)
-    progress = torch.tensor((n + 1) / N * 100, dtype=torch.float64)
-    print(f"\r-> {progress.item():.2f}% done", end="")
-    print(f"\n********************* END NS.. {n} ****************************************************")
+#      # Progress tracker (as percentage)
+#     progress = torch.tensor((n + 1) / N * 100, dtype=torch.float64)
+#     print(f"\r-> {progress.item():.2f}% done", end="")
+#     print(f"\n********************* END NS.. {n} ****************************************************")
 
 
 #%% 
+# --------------------------------------------------------------------------------------------------------------------------
+# more efficient and work better compared to the loop version
 # run process using ThreadPoolExecutor approach
 # Start timing
 init_time = datetime.now()
@@ -417,10 +416,11 @@ with ThreadPoolExecutor() as executor:
 
     for future in as_completed(futures_test):
         try:
-            n, true_price, expert, gam = future.result()
+            n, true_price, expert, gam, lg_gbm = future.result()
             forecasts_test[n, :, 0] = true_price
             forecasts_test[n, :, 1] = torch.tensor(expert, dtype=forecasts.dtype, device=forecasts.device)
             forecasts_test[n, :, 2] = torch.tensor(gam, dtype=forecasts.dtype, device=forecasts.device)
+            forecasts_test[n, :, 3] = torch.tensor(lg_gbm, dtype=forecasts.dtype, device=forecasts.device)
         except Exception as e:
             print(f"Thread crashed: {e}")
 
@@ -430,6 +430,8 @@ duration_minutes = (end_time - init_time).total_seconds() / 60
 print(f"\nParallel training duration (threaded): {duration_minutes:.2f} minutes")
 
 #%%
+# -------------------------------------------------------------------------------------------------------------------------
+# estimate results using train + validation datasets and predict using the test dataset
 # estimate rmse for all models, test dataset
 true_values_test = forecasts_test[:, :, 0] 
 
@@ -449,14 +451,56 @@ mse_per_model_test = squared_errors_test.mean(dim=(0, 1))
 
 # Take square root to get RMSE per model
 rmse_per_model_test = torch.sqrt(mse_per_model_test) 
+print(rmse_per_model_test)
 
 # %%
-# chart for test data, last obs
-last_obs_ = 300
+# chart for a specific hour and days
+#select the hour, chart for a specific hour
+hour = 14
+# Select the actual and forecasted prices for the specific hour
+true_values_ = forecasts_test[:, hour, 0].cpu().numpy()
+forecast_values_ = forecasts_test[:, hour, 1].cpu().numpy()
+
+#Specify the dates of the test data
+dates_x_ = days_eval[-N:]
+# Line plot comparison
+plt.figure(figsize=(10, 5))
+plt.plot(dates_x_, true_values_, label="True")
+plt.plot(dates_x_, forecast_values_, label="Forecast (Expert)", alpha=0.7, linewidth=2)
+plt.plot(dates_x_, forecasts_test[:, hour, 2].cpu().numpy(), label="GAM", linestyle=":")
+plt.plot(dates_x_, forecasts_test[:, hour, 3].cpu().numpy(), label="light gbm", linestyle="--")
+plt.title(f"Forecast vs True Values at hour {hour} Across Test Data")
+plt.xlabel("Date")
+plt.ylabel("Price")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+#%%
+# chart for the last days
+# Select last days, chart for one day 
+obs =  -30
 plt.figure(figsize=(10, 4))
-plt.plot(forecasts_test[:, :, 0].flatten().cpu().numpy()[-last_obs_:], label="True", linewidth=2)
-plt.plot(forecasts_test[:, :, 1].flatten().cpu().numpy()[-last_obs_:], label="Expert Forecast", linestyle="--")
-plt.plot(forecasts_test[:, :, 2].flatten().cpu().numpy()[-last_obs_:], label="GAM", linestyle=":")
+plt.plot(forecasts_test[obs:, :, 0].flatten().cpu().numpy(), label="True", linewidth=2)
+plt.plot(forecasts_test[obs:, :, 1].flatten().cpu().numpy(), label="Expert Forecast", linestyle="--")
+plt.plot(forecasts_test[obs:, :, 2].flatten().cpu().numpy(), label="GAM", linestyle=":")
+plt.plot(forecasts_test[obs:, :, 3].flatten().cpu().numpy(), label="light gbm", linestyle="--")
+plt.xlabel("Hours")
+plt.ylabel("Price")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+
+# %%
+# chart for test data
+plt.figure(figsize=(10, 4))
+plt.plot(forecasts_test[:, :, 0].flatten().cpu().numpy(), label="True", linewidth=2)
+plt.plot(forecasts_test[:, :, 1].flatten().cpu().numpy(), label="Expert Forecast", linestyle="--")
+plt.plot(forecasts_test[:, :, 2].flatten().cpu().numpy(), label="GAM", linestyle=":")
+plt.plot(forecasts_test[:, :, 3].flatten().cpu().numpy(), label="light gbm", linestyle="--")
 plt.xlabel("Hours")
 plt.ylabel("Price")
 plt.legend()
