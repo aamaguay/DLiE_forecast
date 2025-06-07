@@ -763,8 +763,6 @@ def forecast_lgbm_whole_sample(dat, days, wd, price_s_lags, da_lag, reg_names, f
     }
 
 
-
-
 def run_forecast_step(n, price_S, data_array, begin_eval, D, dates_S, wd, price_s_lags, da_lag, reg_names, data_columns):
     print(f"START NS: {n}")
     
