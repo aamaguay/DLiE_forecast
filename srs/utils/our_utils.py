@@ -33,14 +33,26 @@ def run_forecast_step(n,
     
     # Save true price
     true_price = price_S[begin_eval + n]
-    print(f"START NS: {n}  index: {begin_eval + n}  data shape: {data_array.shape}")
     
     # Get days and data slice
-    days = pd.to_datetime(dates_S[(begin_eval - D + n):(begin_eval + 1 + n)])
     dat_slice = data_array[(begin_eval - D + n):(begin_eval + 1 + n)]
+    print(f"START NS: {n}  index: {begin_eval + n}  data shape: {data_array.shape}")
+    
+    days = pd.to_datetime(dates_S[(begin_eval - D + n):(begin_eval + 1 + n)])
 
     # GAM forecast
-    gam_forecast = forecast_gam_whole_sample(
+    gam_forecast_24h = forecast_gam_whole_sample(
+        dat=dat_slice,
+        days=days,
+        wd=wd,
+        price_s_lags=price_s_lags,
+        da_lag=da_lag,
+        reg_names=data_columns,
+        fuel_lags=[2]
+    )["forecasts"]
+    
+        # GAM forecast
+    gam_forecast_per_hour = forecast_gam(
         dat=dat_slice,
         days=days,
         wd=wd,
@@ -73,4 +85,4 @@ def run_forecast_step(n,
     # )["forecasts"]
 
     print(f"END NS: {n}")
-    return n, gam_forecast  
+    return n, gam_forecast_24h, gam_forecast_per_hour  
