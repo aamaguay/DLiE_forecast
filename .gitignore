@@ -1,0 +1,49 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env/
+
+# IDE/editor settings
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# Jupyter Notebook checkpoints and outputs
+.ipynb_checkpoints/
+*.nbconvert.ipynb
+
+# Data files, logs, runtime
+*.csv
+*.h5
+*.db
+*.sqlite
+*.log
+*.out
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# credentials
+*.key
+*.pem
+.env
+
+# Mac/Linux swap files
+.*.swp
