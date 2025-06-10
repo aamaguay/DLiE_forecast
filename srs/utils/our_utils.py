@@ -19,70 +19,81 @@ from srs.models.gam import forecast_gam, forecast_gam_whole_sample
 from srs.utils.tutor_utils import forecast_expert_ext, forecast_expert_ext_modifed
 from srs.models.light_gbm import forecast_lgbm_whole_sample
 
-def run_forecast_step(n, 
-                      price_S, 
-                      data_array, 
-                      begin_eval, 
-                      D, 
-                      dates_S, 
-                      wd, 
-                      price_s_lags, 
-                      da_lag, 
-                      reg_names, 
-                      data_columns):
+def run_forecast_step(
+    n,
+    price_S,
+    data_array,
+    train_start_idx,
+    train_end_idx,
+    dates_S,
+    wd,
+    price_s_lags,
+    da_lag,
+    feature_names,
+):
+    """
+    n               : offset into the 2024 evaluation period
+    train_start_idx : integer index of 2019-01-01 in dates_S
+    train_end_idx   : integer index of 2023-12-31 in dates_S
+    """
+    # compute the window bounds
+    start_idx = train_start_idx
+    end_idx   = train_end_idx + n   # inclusive
     
-    # Save true price
-    true_price = price_S[begin_eval + n]
+    # slice out the training data & dates
+    dat_slice = data_array[start_idx : end_idx + 1]
+    days      = pd.to_datetime(dates_S[start_idx : end_idx + 1])
     
-    # Get days and data slice
-    dat_slice = data_array[(begin_eval - D + n):(begin_eval + 1 + n)]
-    print(f"START NS: {n}  index: {begin_eval + n}  data shape: {data_array.shape}")
+    # # true price of the forecast day for evaluation
+    # forecast_date_idx = end_idx + 1
+    # true_price = price_S[forecast_date_idx]
     
-    days = pd.to_datetime(dates_S[(begin_eval - D + n):(begin_eval + 1 + n)])
-
-    # GAM forecast
+    print(f"Loop {n:3d}: train {dates_S[start_idx]} -> {dates_S[end_idx]}, "
+          f"forecast {dates_S[end_idx+1]}")
+    
+    # GAM forecast (24 h ahead)
     gam_forecast_24h = forecast_gam_whole_sample(
         dat=dat_slice,
         days=days,
         wd=wd,
         price_s_lags=price_s_lags,
         da_lag=da_lag,
-        reg_names=data_columns,
+        reg_names=feature_names,
         fuel_lags=[2]
     )["forecasts"]
     
-        # GAM forecast
-    gam_forecast_per_hour = forecast_gam(
-        dat=dat_slice,
-        days=days,
-        wd=wd,
-        price_s_lags=price_s_lags,
-        da_lag=da_lag,
-        reg_names=data_columns,
-        fuel_lags=[2]
-    )["forecasts"]
-
-    # # Expert model forecast
-    # expert_forecast = forecast_expert_ext_modifed(
+    # # per‐hour GAM forecast
+    # gam_forecast_per_hour = forecast_gam(
     #     dat=dat_slice,
     #     days=days,
     #     wd=wd,
     #     price_s_lags=price_s_lags,
     #     da_lag=da_lag,
-    #     reg_names=data_columns,
+    #     reg_names=feature_names,
     #     fuel_lags=[2]
     # )["forecasts"]
+  
+# # Expert model forecast
+#   expert_forecast = forecast_expert_ext_modifed(
+#       dat=dat_slice,
+#       days=days,
+#       wd=wd,
+#       price_s_lags=price_s_lags,
+#       da_lag=da_lag,
+#       reg_names=feature_names,
+#       fuel_lags=[2]
+#   )["forecasts"]
 
-    # # lg_gbm model forecast
-    # lg_gbm_forecast = forecast_lgbm_whole_sample(
-    #     dat=dat_slice,
-    #     days=days,
-    #     wd=wd,
-    #     price_s_lags=price_s_lags,
-    #     da_lag=da_lag,
-    #     reg_names=data_columns,
-    #     fuel_lags=[2]
-    # )["forecasts"]
-
-    print(f"END NS: {n}")
-    return n, gam_forecast_24h, gam_forecast_per_hour  
+#   # lg_gbm model forecast
+#   lg_gbm_forecast = forecast_lgbm_whole_sample(
+#       dat=dat_slice,
+#       days=days,
+#       wd=wd,
+#       price_s_lags=price_s_lags,
+#       da_lag=da_lag,
+#       reg_names=feature_names,
+#       fuel_lags=[2]
+#   )["forecasts"]
+    
+    print(f"-> finished loop {n}")
+    return n, gam_forecast_24h

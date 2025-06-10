@@ -212,7 +212,7 @@ def prepare_dataset_tensor(
         Slice `[..., 0]` (price) of `train_tensor` for convenience.
     """
 
-    # 1. Deterministic environment & device
+    # Deterministic environment & device
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
     torch.manual_seed(seed)
@@ -228,32 +228,22 @@ def prepare_dataset_tensor(
     else:
         device = torch.device("cpu")
 
-    # 2. Load CSV and parse time column
     df = pd.read_csv(Path(csv_path))
     time_utc = pd.to_datetime(df["time_utc"], utc=True, format="%Y-%m-%d %H:%M:%S")
 
-    # Local‑time conversion (for DST_trafo bookkeeping)
     time_lt = time_utc.dt.tz_convert(tz)
-
-    # 3. Daylight‑saving adjustment – exact call from notebook
     data_array = DST_trafo(X=df.iloc[:, 1:], Xtime=time_utc, tz=tz)
-
-    # 4. Torch tensor on the chosen device
     data_tensor = torch.tensor(data_array, dtype=dtype, device=device)
-
-    # Price slice (index 0) kept for convenience
     price_tensor = data_tensor[..., 0]
 
-    # 5. Train / evaluation split (last `test_days` days)
     if test_days >= data_tensor.shape[0]:
         raise ValueError("test_days must be smaller than the dataset length")
-
-    train_tensor = data_tensor
+    
+    train_tensor = data_tensor[:-test_days]
 
     # Build local‑time date index parallel to tensor rows
-    # (use the unique days from time_lt)
     local_dates = pd.Series(time_lt.dt.date.unique())
-    train_dates = local_dates
+    train_dates = local_dates[:-test_days]
 
     return data_tensor, train_tensor, train_dates, price_tensor
 
