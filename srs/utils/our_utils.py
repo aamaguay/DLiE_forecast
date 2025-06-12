@@ -25,7 +25,7 @@ def run_forecast_step(
     data_array,
     train_start_idx,
     train_end_idx,
-    dates_S,
+    full_dates,
     wd,
     price_s_lags,
     da_lag,
@@ -42,14 +42,18 @@ def run_forecast_step(
     
     # slice out the training data & dates
     dat_slice = data_array[start_idx : end_idx + 1]
-    days      = pd.to_datetime(dates_S[start_idx : end_idx + 1])
+    days      = pd.Series(full_dates[start_idx : end_idx + 1])  # <- Change to_datetime to Series, otherwise \
+                                                                # weekdays_num inside gam_forecast_24h = forecast_gam_whole_sample()
+                                                                # will crash
+
     
     # # true price of the forecast day for evaluation
     # forecast_date_idx = end_idx + 1
     # true_price = price_S[forecast_date_idx]
     
-    print(f"Loop {n:3d}: train {dates_S[start_idx]} -> {dates_S[end_idx]}, "
-          f"forecast {dates_S[end_idx+1]}")
+    print(f"Loop {n:3d}: train {full_dates[start_idx]} -> {full_dates[end_idx]}, "
+          f"forecast {full_dates[end_idx+1]}")
+    print(f"  dat_slice shape: {dat_slice.shape}  → flatten count = {dat_slice.shape[0]*24}")
     
     # GAM forecast (24 h ahead)
     gam_forecast_24h = forecast_gam_whole_sample(
