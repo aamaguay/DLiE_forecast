@@ -54,7 +54,7 @@ def forecast_lgbm_whole_sample(dat, days, wd, price_s_lags, da_lag, reg_names, f
 
     da_all = []
     for i in da_idx:
-        series = torch.tensor(flat_dat[:, i], dtype=torch.float32, device=device)
+        series = flat_dat[:, i].detach().clone()
         lagged = torch.stack([get_lagged(series, lag) for lag in da_lag], dim=1)
         da_all.append(lagged)
     da_all_var = torch.cat(da_all, dim=1)

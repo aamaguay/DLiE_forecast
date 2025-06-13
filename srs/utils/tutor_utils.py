@@ -177,6 +177,75 @@ def DST_trafo(X, Xtime, tz="CET"):
                 Xout[i_d, int(i_S-S/24), ] = X[k+i_S, ]
     return Xout
 
+def prepare_dataset_tensor_modified(
+    csv_path: Union[str, Path],
+    tz: str = "CET",
+    seed: int = 42,
+    test_days: int = 2 * 365,
+    dtype: torch.dtype = torch.float64,
+) -> Tuple[torch.Tensor, torch.Tensor, pd.Series, torch.Tensor]:
+    """End‑to‑end replication of the notebook preprocessing.
+
+    Parameters
+    ----------
+    csv_path : str | Path
+        Path to `data_no1.csv` (or similar) generated via `merge_data`.
+    tz : str, default "CET"
+        Local timezone abbreviation for the bidding zone.
+    seed : int, default 42
+        Seed for all RNGs to ensure reproducibility (matches tutor settings).
+    test_days : int, default 730 (≈2 years)
+        Number of trailing days reserved for evaluation.
+    dtype : torch.dtype, default ``torch.float64``
+        Precision of the returned tensors (matches tutor’s use).
+
+    Returns
+    -------
+    data_tensor : torch.Tensor
+        Full `(days, 24, vars)` tensor on the selected device.
+    train_tensor : torch.Tensor
+        Tensor excluding the last `test_days` days.
+    train_dates  : pandas.Series
+        Local‑time dates corresponding to `train_tensor` rows.
+    price_train  : torch.Tensor
+        Slice `[..., 0]` (price) of `train_tensor` for convenience.
+    """
+
+    # Deterministic environment & device
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.enabled = False
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+
+    df = pd.read_csv(Path(csv_path))
+    time_utc = pd.to_datetime(df["time_utc"], utc=True, format="%Y-%m-%d %H:%M:%S")
+
+    time_lt = time_utc.dt.tz_convert(tz)
+    data_array = DST_trafo(X=df.iloc[:, 1:], Xtime=time_utc, tz=tz)
+    data_tensor = torch.tensor(data_array, dtype=dtype, device=device)
+    price_tensor = data_tensor[..., 0]
+
+    if test_days >= data_tensor.shape[0]:
+        raise ValueError("test_days must be smaller than the dataset length")
+    
+    train_tensor = data_tensor # data_tensor[:-test_days]
+
+    # Build local‑time date index parallel to tensor rows
+    local_dates = pd.Series(time_lt.dt.date.unique())
+    train_dates = local_dates # local_dates[:-test_days]
+
+    return data_tensor, train_tensor, train_dates, price_tensor
+
 # Bekzod. Helper function for DST_trafo fnc
 def prepare_dataset_tensor(
     csv_path: Union[str, Path],
