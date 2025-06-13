@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from srs.models.gam import forecast_gam, forecast_gam_whole_sample
 from srs.utils.tutor_utils import forecast_expert_ext, forecast_expert_ext_modifed
-from srs.models.light_gbm import forecast_lgbm_whole_sample
+from srs.models.light_gbm import forecast_lgbm_whole_sample, forecast_lgbm_whole_sample_LongShortTerm_w_Optuna
 
 def run_forecast_step_modified(
     n,
@@ -29,15 +29,20 @@ def run_forecast_step_modified(
     wd,
     price_s_lags,
     da_lag,
-    feature_names,
+    feature_names,n_trials_lgbm,
+    days_for_st_model
 ):
     """
     n               : offset into the 2024 evaluation period
     train_start_idx : integer index of 2019-01-01 in dates_S
     train_end_idx   : integer index of 2023-12-31 in dates_S
     """
+    if n == 0:
+        reduction = 0
+    else:
+        reduction = 60 * ((n - 1) // 100 + 1)
     # compute the window bounds
-    start_idx = train_start_idx + n # rolling window (train_start_idx + n)
+    start_idx = train_start_idx + n + reduction # rolling window (train_start_idx + n)
     end_idx   = train_end_idx  +  n   # inclusive
     
     # slice out the training data & dates
@@ -85,15 +90,28 @@ def run_forecast_step_modified(
 #       fuel_lags=[2]
 #   )["forecasts"]
 
+    # # lg_gbm model forecast
+    # lg_gbm_forecast = forecast_lgbm_whole_sample(
+    #   dat=dat_slice,
+    #   days=days,
+    #   wd=wd,
+    #   price_s_lags=price_s_lags,
+    #   da_lag=da_lag,
+    #   reg_names=feature_names,
+    #   fuel_lags=[2]
+    # )["forecasts"]
+
     # lg_gbm model forecast
-    lg_gbm_forecast = forecast_lgbm_whole_sample(
+    lg_gbm_forecast = forecast_lgbm_whole_sample_LongShortTerm_w_Optuna(
       dat=dat_slice,
       days=days,
       wd=wd,
       price_s_lags=price_s_lags,
       da_lag=da_lag,
       reg_names=feature_names,
-      fuel_lags=[2]
+      fuel_lags=[2],
+      n_trials_lgbm = n_trials_lgbm,
+      days_for_st_model = days_for_st_model
     )["forecasts"]
     
     print(f"-> finished loop {n}")
