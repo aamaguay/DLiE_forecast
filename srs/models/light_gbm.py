@@ -273,8 +273,8 @@ def forecast_lgbm_whole_sample_LongShortTerm_w_Optuna(
     val_horizon = S
 
     # Define validation indices (penultimate day)
-    X_val = X_train[-(val_horizon * 2):-val_horizon]
-    y_val = y_train[-(val_horizon * 2):-val_horizon]
+    X_val = X_train[-(val_horizon * 2):]
+    y_val = y_train[-(val_horizon * 2):]
 
     # Split for long-term model
     X_long = X_train[:-(val_horizon * 2)]
