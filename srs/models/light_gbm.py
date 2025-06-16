@@ -84,14 +84,14 @@ def forecast_lgbm_whole_sample(dat, days, wd, price_s_lags, da_lag, reg_names, f
     # "Price" -- rolling window, median 2 days
     price_tensor = flat_dat[:, reg_names.index("Price")]
     load_da_tensor = flat_dat[:, reg_names.index("Load_DA")]
-    roll2d_median_Price = rolling_median(price_tensor, window=48)
+    roll2H_median_Price = rolling_median(price_tensor, window=2)
     pct_chg_Load_DA = pct_change(load_da_tensor)
     lag168_Load_DA = get_lagged(load_da_tensor, 168)
 
     extra_feats_tensor = torch.stack([
         pct_chg_Load_DA,
         lag168_Load_DA,
-        roll2d_median_Price
+        roll2H_median_Price
     ], dim=1)
 
     # join all data
@@ -119,7 +119,7 @@ def forecast_lgbm_whole_sample(dat, days, wd, price_s_lags, da_lag, reg_names, f
         for lag in fuel_lags:
             feature_names_Xy.append(f"{fuel_name}_lag_{lag}")
 
-    feature_names_Xy += ["pct_chg_Load_DA", "lag168_Load_DA", "roll2d_median_Price"]
+    feature_names_Xy += ["pct_chg_Load_DA", "lag168_Load_DA", "roll2H_median_Price"]
     # --- ------ ----
 
     # --- Clean NaNs ---
@@ -244,14 +244,14 @@ def forecast_lgbm_whole_sample_LongShortTerm_w_Optuna(
     # "Price" -- rolling window, median 2 days
     price_tensor = flat_dat[:, reg_names.index("Price")]
     load_da_tensor = flat_dat[:, reg_names.index("Load_DA")]
-    roll2d_median_Price = rolling_median(price_tensor, window=48)
+    roll2H_median_Price = rolling_median(price_tensor, window=2)
     pct_chg_Load_DA = pct_change(load_da_tensor)
     lag168_Load_DA = get_lagged(load_da_tensor, 168)
 
     extra_feats_tensor = torch.stack([
         pct_chg_Load_DA,
         lag168_Load_DA,
-        roll2d_median_Price
+        roll2H_median_Price
     ], dim=1)
 
     # join all data
@@ -279,7 +279,7 @@ def forecast_lgbm_whole_sample_LongShortTerm_w_Optuna(
         for lag in fuel_lags:
             feature_names_Xy.append(f"{fuel_name}_lag_{lag}")
 
-    feature_names_Xy += ["pct_chg_Load_DA", "lag168_Load_DA", "roll2d_median_Price"]
+    feature_names_Xy += ["pct_chg_Load_DA", "lag168_Load_DA", "roll2H_median_Price"]
     # --- ------ ----
 
     mask = ~torch.isnan(Xy).any(dim=1)
@@ -467,14 +467,14 @@ def forecast_lgbm_whole_sample_optuna_selectBestOptions(
     # "Price" -- rolling window, median 2 days
     price_tensor = flat_dat[:, reg_names.index("Price")]
     load_da_tensor = flat_dat[:, reg_names.index("Load_DA")]
-    roll2d_median_Price = rolling_median(price_tensor, window=48)
+    roll2H_median_Price = rolling_median(price_tensor, window=2)
     pct_chg_Load_DA = pct_change(load_da_tensor)
     lag168_Load_DA = get_lagged(load_da_tensor, 168)
 
     extra_feats_tensor = torch.stack([
         pct_chg_Load_DA,
         lag168_Load_DA,
-        roll2d_median_Price
+        roll2H_median_Price
     ], dim=1)
 
     # join all data
@@ -505,7 +505,7 @@ def forecast_lgbm_whole_sample_optuna_selectBestOptions(
         for lag in fuel_lags:
             feature_names_Xy.append(f"{fuel_name}_lag_{lag}")
 
-    feature_names_Xy += ["pct_chg_Load_DA", "lag168_Load_DA", "roll2d_median_Price"]
+    feature_names_Xy += ["pct_chg_Load_DA", "lag168_Load_DA", "roll2H_median_Price"]
     # --- ------ ----
 
     n_total = Xy.shape[0]
