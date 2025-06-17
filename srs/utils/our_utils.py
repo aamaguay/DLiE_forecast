@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from srs.models.gam import forecast_gam, forecast_gam_whole_sample
 from srs.utils.tutor_utils import forecast_expert_ext, forecast_expert_ext_modifed
-from srs.models.light_gbm import forecast_lgbm_whole_sample, forecast_lgbm_whole_sample_LongShortTerm_w_Optuna
+from srs.models.light_gbm import forecast_lgbm_whole_sample, forecast_lgbm_whole_sample_LongShortTerm_w_Optuna, forecast_lgbm_whole_sample_optuna_selectBestOptions
 
 def run_forecast_step_modified(
     n,
