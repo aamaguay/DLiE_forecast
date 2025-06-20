@@ -13,6 +13,67 @@ import optuna
 #set the GPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
  
+def forecast_lgbm_whole_sample_justTrainig(Xy, feature_names_Xy):
+    S = Xy.shape[1]  # 24 hours
+    T = Xy.shape[0]  # 731 days
+    Xy = Xy.reshape(-1, Xy.shape[-1]) 
+    # --- Clean NaNs ---
+    mask = ~torch.isnan(Xy).any(dim=1)
+    Xy = Xy[mask]
+
+    # --- Split into train and forecast sets ---
+    n_total = Xy.shape[0]
+    last_day_indices = torch.arange(n_total - S, n_total, device=device)
+
+    # Normalize data
+    mean = Xy[:-S, :].mean(dim=0)
+    std = Xy[:-S, :].std(dim=0)
+    std[std == 0] = 1
+    Xy_scaled = (Xy - mean) / std
+
+    forecast_x = Xy_scaled[last_day_indices, 1:]
+    y_true_test = Xy_scaled[last_day_indices, 0].cpu().numpy()
+    train_mask = torch.ones(n_total, dtype=torch.bool, device=device)
+    train_mask[last_day_indices] = False
+
+    X_train = Xy_scaled[train_mask, 1:].cpu().numpy()
+    y_train = Xy_scaled[train_mask, 0].cpu().numpy()
+    x_pred = forecast_x.cpu().numpy()
+    x_pred = pd.DataFrame(x_pred, columns=feature_names_Xy[1:])
+
+    # --- Train LightGBM ---
+    lgb_model = lgb.LGBMRegressor(n_estimators=100, learning_rate=0.1)
+    lgb_model.fit(X_train, y_train)
+
+    # --- Predict and denormalize ---
+    y_pred_in_sample = lgb_model.predict(pd.DataFrame(X_train, columns=feature_names_Xy[1:]))
+    y_in_sample =  Xy_scaled[train_mask, 0].cpu().numpy()
+
+    mse_in_sample = np.mean((y_pred_in_sample - y_in_sample) ** 2)
+    y_pred = lgb_model.predict(x_pred)
+    mse_test = np.mean((y_pred - y_true_test) ** 2)
+    y_pred = (y_pred * std[0].cpu().item()) + mean[0].cpu().item()
+
+    print(f"mse in sample: {mse_in_sample},....mse in test: {mse_test}")
+
+    importances = lgb_model.feature_importances_
+    feature_importance_df = pd.DataFrame({
+        "feature": feature_names_Xy[1:],  # skip the raw "Price" if your model did
+        "importance": importances
+    })
+
+    # Sort by importance
+    feature_importance_df = feature_importance_df.sort_values(by="importance", ascending=False)
+
+    # Print
+    print(feature_importance_df)
+
+    return {
+        "model": lgb_model,
+        "n_features": X_train.shape[1],
+        "forecasts": torch.tensor(y_pred, dtype=torch.float32, device=device)
+    }
+
 def forecast_lgbm_whole_sample(dat, days, wd, price_s_lags, da_lag, reg_names, fuel_lags):
     def get_lagged(Z, lag):
         if isinstance(Z, np.ndarray):

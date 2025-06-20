@@ -6,7 +6,7 @@ from scipy.stats import t
 from sklearn.linear_model import LinearRegression
 from calendar import day_abbr
 import torch
-from pygam import LinearGAM, s
+from pygam import LinearGAM, s, l
 from datetime import datetime
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -217,6 +217,85 @@ def forecast_gam_whole_sample(dat, days, wd, price_s_lags, da_lag, reg_names, fu
 
     return {
     "coef_df": coefs_df,
+    "statistics_": gam.statistics_,
+    "n_features": X_train.shape[1],
+    "forecasts": torch.tensor(y_pred, dtype=torch.float32, device=device)
+    }
+
+def forecast_gam_whole_sample_justTrainig(Xy, feature_names_Xy, apply_spline_over_varList):
+    def build_gam_terms(feature_names, apply_spline_over_varList):
+        terms = None
+        for idx, name in enumerate(feature_names):
+            term = s(idx) if name in apply_spline_over_varList else l(idx)
+            terms = term if terms is None else terms + term
+        return terms
+    
+    S = Xy.shape[1]  # 24 hours
+    T = Xy.shape[0]  # 731 days
+    Xy = Xy.reshape(-1, Xy.shape[-1]) 
+    # --- Split into training and prediction sets ---
+    mask = ~torch.isnan(Xy).any(dim=1)
+    Xy = Xy[mask]
+
+    # Separate last 24 hours (forecast target)
+    n_total = Xy.shape[0]
+    last_day_indices = torch.arange(n_total - S, n_total, device=device)
+
+    # estimate mean and std dv
+    mean = Xy[:-S,:].mean(dim=0)
+    std = Xy[:-S,:].std(dim=0)
+    std[std == 0] = 1 # Prevent division by zero
+    Xy_scaled = (Xy - mean) / std
+          
+
+    # Separate last 24 hours (forecast target)
+    forecast_x = Xy_scaled[last_day_indices,1:]
+    train_mask = torch.ones(n_total, dtype=torch.bool, device=device)
+    train_mask[last_day_indices] = False
+
+    X_train = Xy_scaled[train_mask, 1:].cpu().numpy()
+    y_train = Xy_scaled[train_mask,0].cpu().numpy()
+    x_pred = forecast_x.cpu().numpy()
+
+    # create s-terms
+    terms = build_gam_terms(feature_names_Xy[1:], apply_spline_over_varList)
+    
+    # ft a gam
+    gam = LinearGAM(terms).fit(X_train, y_train)
+    # print(gam.summary())
+
+    # --- Predict and collect output ---
+    y_pred = gam.predict(x_pred)
+
+    y_pred = ( (y_pred) * std[0].cpu().item() ) + mean[0].cpu().item()
+    # print(y_pred)
+
+    # --- Save model coefficients ---
+    # Extract all coefficients and the mapping to features
+    coef = gam.coef_
+    term_features = gam.terms.feature  # array mapping each coef to a feature index (or None for intercept)
+
+    # # Group coefficients by feature
+    # coef_dict = defaultdict(list)
+    # for c, f in zip(coef, term_features):
+    #     if f is not None:
+    #         coef_dict[f].append(c)
+
+    # # Pad rows to same length
+    # max_len = max(len(v) for v in coef_dict.values())
+    # coef_matrix = np.array([
+    #     np.pad(v, (0, max_len - len(v)), constant_values=np.nan)
+    #     for k, v in sorted(coef_dict.items())
+    # ])
+
+    # # Assign feature names
+    # feature_names = ['Feature_' + str(i) for i in sorted(coef_dict.keys())]
+    # col_names = [f'coef_{j}' for j in range(max_len)]
+    # coefs_df = pd.DataFrame(coef_matrix, index=feature_names, columns=col_names)
+
+    # print(coefs_df)
+
+    return {
     "statistics_": gam.statistics_,
     "n_features": X_train.shape[1],
     "forecasts": torch.tensor(y_pred, dtype=torch.float32, device=device)
