@@ -15,11 +15,6 @@ import optuna
 from torch import nn, optim
 from torch.utils.data import DataLoader, TensorDataset
 
-# constants that were globals in the tutor's notebook
-WD_DEFAULT          = [1,2,3,4,5,6,7]
-PRICE_LAGS_DEFAULT  = [1,2,7]
-DA_LAG_DEFAULT      = [0]
-FUEL_LAGS_DEFAULT   = [2]
 
 #set the GPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -213,8 +208,8 @@ def build_mlp_rolling_forecasts_weighted_loss(
         weight_decay: float,
         batch_size  : int,
         epochs      : int,
+        alpha       : float,         # time-decay weight
         device      : torch.device | None = None,
-        alpha       : float = 0.002,          # time-decay weight
 ):
     """
     Rolling one-day-ahead MLP with EXPONENTIAL time-decay applied
@@ -284,7 +279,7 @@ def build_mlp_rolling_forecasts_weighted_loss(
             # train RMSE
             pred_train_std = model(X_train)
             resid_train    = pred_train_std - y_train 
-            train_rmse_day = torch.sqrt((resid_train**2).mean()) * std_y.mean()
+            train_rmse_day = torch.sqrt(((resid_train * std_y)**2).mean())
             train_rmses.append(train_rmse_day.item())
 
             # test (next-day)
@@ -299,7 +294,89 @@ def build_mlp_rolling_forecasts_weighted_loss(
     return preds.cpu(), trues.cpu(), train_rmses, test_rmses
 
 
+def build_mlp_rolling_forecasts_weighted_data(
+        regmat_df   : pd.DataFrame,
+        dep_indices : List[int],
+        window      : int,
+        horizon     : int,
+        start_row   : int,
+        hidden_dim  : int,
+        lr          : float,
+        weight_decay: float,
+        batch_size  : int,
+        epochs      : int,
+        alpha       : float,                # time-decay weight
+        device      : torch.device | None = None,
+):
+    device = device or torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu")
 
+    regmat  = torch.tensor(regmat_df.values, dtype=torch.float32, device=device)
+    dep_var = regmat[:, dep_indices]
+    regmat[:, dep_indices] = 0
+
+    S      = dep_var.shape[1]
+    preds  = torch.empty((horizon, S), device=device)
+    trues  = torch.empty((horizon, S), device=device)
+    train_rmses, test_rmses = [], []
+
+    w_full = torch.exp(-alpha * torch.arange(window-1, -1, -1, device=device))  
+
+    for n in range(horizon):
+        idx = start_row + n
+
+        # standardise
+        mean_x = regmat[idx-window:idx].mean(0, keepdim=True)
+        std_x  = regmat[idx-window:idx].std(0, keepdim=True).clamp_min_(1e-9)
+        X_train = (regmat[idx-window:idx] - mean_x) / std_x
+        X_test  = ((regmat[idx] - mean_x) / std_x).unsqueeze(0)
+
+        mean_y = dep_var[idx-window:idx].mean(0, keepdim=True)
+        std_y  = dep_var[idx-window:idx].std(0, keepdim=True).clamp_min_(1e-9)
+        y_train = (dep_var[idx-window:idx] - mean_y) / std_y
+        y_true  = dep_var[idx].unsqueeze(0)
+
+        # apply weights to data (rows)
+        X_train_w = X_train * w_full.unsqueeze(1)
+        y_train_w = y_train * w_full.unsqueeze(1)
+
+        loader = DataLoader(
+            TensorDataset(X_train_w, y_train_w),
+            batch_size=batch_size, shuffle=False, num_workers=0)
+
+        model = DeepMLP(input_dim=X_train.shape[1],
+                        hidden_dim=hidden_dim,
+                        output_dim=y_train.shape[1],
+                        n_hidden=2, dropout_p=0.10).to(device)
+
+        opt = torch.optim.Adam(model.parameters(),
+                               lr=lr, weight_decay=weight_decay)
+        loss_fn = nn.MSELoss()
+
+        for _ in range(epochs):
+            model.train()
+            for xb, yb in loader:
+                opt.zero_grad()
+                loss = loss_fn(model(xb), yb)     # plain MSE
+                loss.backward()
+                opt.step()
+
+        # forecast and evaluate
+        model.eval()
+        with torch.no_grad():
+            pred_train_std = model(X_train_w)
+            resid_train    = pred_train_std - y_train_w
+            train_rmse_day = torch.sqrt((resid_train**2).mean()) * std_y.mean()
+            train_rmses.append(train_rmse_day.item())
+
+            pred_std = model(X_test).squeeze(0)
+            pred     = pred_std * std_y + mean_y
+            test_rmses.append(torch.sqrt(((pred - y_true.squeeze(0))**2).mean()).item())
+
+        preds[n] = pred
+        trues[n] = y_true.squeeze(0)
+
+    return preds.cpu(), trues.cpu(), train_rmses, test_rmses
 
 
 # Optuna tuning on evaluation block                            

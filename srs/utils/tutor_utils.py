@@ -18,6 +18,7 @@ from typing import Tuple, Union, Dict, List
 import optuna
 from torch import nn, optim
 from torch.utils.data import DataLoader, TensorDataset
+from typing import List, Dict, Any
 
 #set the GPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1118,24 +1119,17 @@ def run_expert_window_test(
         fuel_lags=fuel_lags, device=device,
     )
 
-
-# constants that were globals in the tutor's notebook
-WD_DEFAULT          = [1,2,3,4,5,6,7]
-PRICE_LAGS_DEFAULT  = [1,2,7]
-DA_LAG_DEFAULT      = [0]
-FUEL_LAGS_DEFAULT   = [2]
-
-# ------------------------------------------------------------------ #
-# 1)  Build regression matrix (one row = one day)                    #
-# ------------------------------------------------------------------ #
+# Build regression matrix (one row = one day)                    
 def build_regression_matrix(
     dat_eval: np.ndarray,        # (Days, 24, Vars)
     days_eval: pd.Series,        # len Days   (datetime, local tz)
     reg_names: pd.Index,
-    wd: List[int]          = WD_DEFAULT,
-    price_lags: List[int]   = PRICE_LAGS_DEFAULT,
-    da_lag: List[int]       = DA_LAG_DEFAULT,
-    fuel_lags: List[int]    = FUEL_LAGS_DEFAULT,
+    wd: List[int],          
+    price_lags: List[int],
+    da_lag: List[int],       
+    fuel_lags: List[int], 
+    da_names: List[str],
+    fuel_names: List[str],
 ) -> Dict[str, any]:
     """
     Re-implements the tutor’s long reg_matrix() in ~50 lines and returns:
@@ -1144,18 +1138,20 @@ def build_regression_matrix(
       - dep_indices     : list of dependent-variable column positions
     """
     S = dat_eval.shape[1]                    # 24
-    da_names   = ["Load_DA", "Solar_DA", "WindOn_DA", "WindOff_DA"]
-    fuel_names = ["Coal","NGas","Oil","EUA"]
 
     # helper
     def lag_1d(x, k):
         if k == 0: return x
         return np.concatenate([np.full(k, np.nan), x[:-k]])
 
-    # weekday dummies
-    weekdays_num = days_eval.dt.weekday + 1
-    WD = np.column_stack([(weekdays_num == d).astype(int) for d in wd])
-    wd_cols = [f"WD_{d}" for d in wd]
+    # weekday dummies (WD=[0] => drop WD column)
+    if not (len(wd) == 1 and wd[0] == 0):
+        weekdays_num = days_eval.dt.weekday + 1 
+        WD = np.column_stack([(weekdays_num == d).astype(int) for d in wd])
+        wd_cols = [f"WD_{d}" for d in wd]
+    else:
+        WD = np.empty((dat_eval.shape[0], 0))
+        wd_cols = []
 
     # fuel lags
     fuels = dat_eval[:, 0, reg_names.isin(fuel_names)]
@@ -1163,7 +1159,8 @@ def build_regression_matrix(
         [np.apply_along_axis(lag_1d, 0, fuels, k) for k in fuel_lags],
         axis=1)
     fuel_cols = [f"{f}_lag_{k}" for k in fuel_lags for f in fuel_names]
-
+    
+    # assemble base block    
     base_block = np.column_stack([WD, fuel_block])
     base_cols  = wd_cols + fuel_cols
     base_df    = pd.DataFrame(base_block, columns=base_cols)
@@ -1173,7 +1170,8 @@ def build_regression_matrix(
     for s in range(S):
         price = dat_eval[:, s, reg_names == "Price"].ravel()
         price_lag_block = np.column_stack([lag_1d(price,k) for k in price_lags])
-
+        
+        # day-ahead values and their lags
         da_block = []
         da_vals  = dat_eval[:, s, reg_names.isin(da_names)]
         for i in range(len(da_names)):
@@ -1189,10 +1187,10 @@ def build_regression_matrix(
     per_df = pd.concat(per_series, axis=1)
     regmat = pd.concat([per_df, base_df], axis=1)
 
+    # build index structures
     columns_s   = per_series[0].shape[1]
     columns_base= base_df.shape[1]
 
-    # build index structures
     index_dict   = {s: list(range(s*columns_s, (s+1)*columns_s))
                     + list(range(regmat.shape[1]-columns_base,
                                  regmat.shape[1]))
@@ -1205,9 +1203,329 @@ def build_regression_matrix(
         "dep_indices" : dep_indices,
     }
 
-# ------------------------------------------------------------------ #
-# Prepare tensors for one forecast date                          #
-# ------------------------------------------------------------------ #
+# Build regression matrix (one row = one day)                    
+def build_regression_matrix_modified(
+    dat_eval: np.ndarray,        # (Days, 24, Vars)
+    days_eval: pd.Series,        # len Days   (datetime, local tz)
+    reg_names: pd.Index,
+    wd: List[int],               # weekday dummies to include, [0] disables
+    price_lags: List[int],       # lags of spot price to use as regressors
+    da_lag: List[int],           # lags of DA series
+    fuel_lags: List[int],        # lags of fuel series
+    da_names: List[str],         # column names of DA series
+    fuel_names: List[str],       # column names of fuel series
+) -> Dict[str, Any]:
+    """
+    Builds a regression matrix with:
+      - demeaned hourly spot prices as targets (P_center_s{h})
+      - P_daily_mean as a regressor
+      - price lags, DA lags, fuel lags and weekday dummies as regressors
+      - returns regmat (Days × Features), index_dict, and dep_indices.
+    """
+    
+    n_days, S, n_vars = dat_eval.shape
+    price_idx = reg_names.get_loc("Price")
+    df = pd.DataFrame({
+        f"Price_s{h}": dat_eval[:, h, price_idx]
+        for h in range(S)
+    }, index=days_eval)
+    
+    # daily mean and demean
+    df["P_daily_mean"] = df.mean(axis=1)
+    demean_cols = []
+    # for h in range(S):
+    #     center = f"P_center_s{h}"
+    #     df[center] = df[f"Price_s{h}"] - df["P_daily_mean"]
+    #     demean_cols.append(center)
+    # regmat_df = df.drop(columns=[f"Price_s{h}" for h in range(S)])
+
+    # helper for lags
+    def lag_1d(x, k):
+        if k == 0:
+            return x
+        return np.concatenate([np.full(k, np.nan), x[:-k]])
+
+    # weekday dummies
+    if not (len(wd) == 1 and wd[0] == 0):
+        weekdays_num = days_eval.dt.weekday + 1
+        WD = np.column_stack([(weekdays_num == d).astype(int) for d in wd])
+        wd_cols = [f"WD_{d}" for d in wd]
+        wd_df = pd.DataFrame(WD, index=days_eval, columns=wd_cols)
+    else:
+        wd_df = pd.DataFrame(index=days_eval)
+
+    # fuel lags (using horizon 0 as representative)
+    fuels = dat_eval[:, 0, reg_names.isin(fuel_names)]
+    fuel_block = np.concatenate(
+        [np.apply_along_axis(lag_1d, 0, fuels, k) for k in fuel_lags], axis=1
+    )
+    fuel_cols = [f"{f}_lag_{k}" for k in fuel_lags for f in fuel_names]
+    fuel_df = pd.DataFrame(fuel_block, index=days_eval, columns=fuel_cols)
+
+    # per-horizon regressors: price lags and DA lags
+    per_list = []
+    for h in range(S):
+        spot = dat_eval[:, h, price_idx]
+        # daily mean and demean
+        center = f"P_center_s{h}"
+        df[center] = df[f"Price_s{h}"] - df["P_daily_mean"]
+        demean_cols.append(center)
+        # price lags
+        pl = np.column_stack([lag_1d(spot, k) for k in price_lags])
+        pl_cols = [f"Price_lag_{k}_s{h}" for k in price_lags]
+        # DA lags
+        da_vals = dat_eval[:, h, reg_names.isin(da_names)]
+        da_block = np.hstack([
+            np.column_stack([lag_1d(da_vals[:, i], k) for k in da_lag])
+            for i in range(len(da_names))
+        ])
+        da_cols = [f"{n}_lag_{k}_s{h}" for n in da_names for k in da_lag]
+        df_h = pd.DataFrame(
+            np.column_stack([pl, da_block]),
+            index=days_eval,
+            columns=pl_cols + da_cols
+        )
+        per_list.append(df_h)
+    regmat_df = df.drop(columns=[f"Price_s{h}" for h in range(S)])
+    per_df = pd.concat(per_list, axis=1)
+
+    # final regression matrix
+    regmat = pd.concat([regmat_df, per_df, wd_df, fuel_df], axis=1)
+
+    # index_dict: map each horizon h to the position of its demeaned target
+    index_dict = {
+        h: [regmat.columns.get_loc(f"P_center_s{h}")]
+        for h in range(S)
+    }
+    # dep_indices: list of all demeaned target positions
+    dep_indices = [idxs[0] for idxs in index_dict.values()]
+
+    return {
+        "regmat": regmat,
+        "index_dict": index_dict,
+        "dep_indices": dep_indices,
+    }
+
+# with reordering resolved and data leakage issue
+def build_regression_matrix_modified_2(
+    dat_eval: np.ndarray,        # (Days, 24, Vars)
+    days_eval: pd.Series,        # len Days   (datetime, local tz)
+    reg_names: pd.Index,
+    wd: List[int],               # weekday dummies to include, [0] disables
+    price_lags: List[int],       # lags of spot price to use as regressors
+    da_lag: List[int],           # lags of DA series
+    fuel_lags: List[int],        # lags of fuel series
+    da_names: List[str],         # column names of DA series
+    fuel_names: List[str],       # column names of fuel series
+) -> Dict[str, Any]:
+    """
+    Builds a regression matrix with columns ordered by horizon blocks:
+      - P_daily_mean first
+      - For each h in 0..S-1: [P_center_s{h}, Price_lag_*_s{h}, DA_lag_*_s{h}]
+      - Then weekday dummies, then fuel lags
+    Returns regmat (Days × Features), index_dict, and dep_indices.
+    """
+    n_days, S, _ = dat_eval.shape
+    # locate variable indices
+    price_idx = reg_names.get_loc("Price")
+
+    # compute daily mean of raw hourly prices
+    prices = np.stack([dat_eval[:, h, price_idx] for h in range(S)], axis=1)
+    P_daily_mean = prices.mean(axis=1)
+    # prepare P_daily_mean DF
+    df_mean = pd.DataFrame({"P_daily_mean": P_daily_mean}, index=days_eval)
+
+    # helper for lags
+    def lag_1d(x, k):
+        if k == 0:
+            return x
+        return np.concatenate([np.full(k, np.nan), x[:-k]])
+
+    # build per-horizon blocks including demean + lags
+    per_list = []
+    index_dict = {}
+    for h in range(S):
+        # raw spot for horizon h
+        spot_h = dat_eval[:, h, price_idx]
+        # demeaned target
+        center = spot_h - P_daily_mean
+        # price lag features
+        pl_block = np.column_stack([lag_1d(spot_h, k) for k in price_lags])
+        pl_cols = [f"Price_lag_{k}_s{h}" for k in price_lags]
+        # DA lag features
+        da_vals = dat_eval[:, h, reg_names.isin(da_names)]
+        da_block = np.hstack([
+            np.column_stack([lag_1d(da_vals[:, i], k) for k in da_lag])
+            for i in range(len(da_names))
+        ])
+        da_cols = [f"{n}_lag_{k}_s{h}" for n in da_names for k in da_lag]
+        # assemble block DF
+        cols_h = [f"P_center_s{h}"] + pl_cols + da_cols
+        data_h = np.column_stack([center.reshape(-1,1), pl_block, da_block])
+        df_h = pd.DataFrame(data_h, index=days_eval, columns=cols_h)
+        # record index of target within the full concatenation
+        # will be position = len(df_mean.columns) + sum of widths of previous blocks
+        index_dict[h] = [None]  # placeholder, will set after concat
+        per_list.append(df_h)
+
+    # weekday dummies
+    if not (len(wd) == 1 and wd[0] == 0):
+        weekdays_num = days_eval.dt.weekday + 1
+        WD = np.column_stack([(weekdays_num == d).astype(int) for d in wd])
+        wd_cols = [f"WD_{d}" for d in wd]
+        wd_df = pd.DataFrame(WD, index=days_eval, columns=wd_cols)
+    else:
+        wd_df = pd.DataFrame(index=days_eval)
+
+    # fuel lags at horizon 0
+    fuels = dat_eval[:, 0, reg_names.isin(fuel_names)]
+    fuel_block = np.concatenate(
+        [np.apply_along_axis(lag_1d, 0, fuels, k) for k in fuel_lags], axis=1
+    )
+    fuel_cols = [f"{f}_lag_{k}" for k in fuel_lags for f in fuel_names]
+    fuel_df = pd.DataFrame(fuel_block, index=days_eval, columns=fuel_cols)
+
+    # concatenate all pieces in desired order
+    all_blocks = [df_mean] + per_list + ([wd_df] if not wd_df.empty else []) + ([fuel_df] if not fuel_df.empty else [])
+    regmat = pd.concat(all_blocks, axis=1)
+
+    # now fill in index_dict with actual positions
+    col_index = df_mean.shape[1]
+    for h, df_h in enumerate(per_list):
+        # position of P_center_s{h}
+        idx = col_index
+        index_dict[h] = [idx]
+        # advance by number of columns in this block
+        col_index += df_h.shape[1]
+    # dep_indices as ordered list
+    dep_indices = [index_dict[h][0] for h in range(S)]
+
+    return {
+        "regmat": regmat,
+        "index_dict": index_dict,
+        "dep_indices": dep_indices,
+    }
+
+# with both reordering and data leakage resolved
+def build_regression_matrix_reordered_dtleak(
+    dat_eval: np.ndarray,        # (Days, 24, Vars)
+    days_eval: pd.Series,        # len=Days (datetime, local tz)
+    reg_names: pd.Index,         # length=Vars
+    wd: List[int],               # weekday dummies to include; [0] disables
+    price_lags: List[int],       # e.g. [1,2,7]
+    da_lag: List[int],           # e.g. [0]
+    fuel_lags: List[int],        # e.g. [2]
+    da_names: List[str],         # ["Load_DA","Solar_DA",…]
+    fuel_names: List[str],       # ["Coal","NGas",…]
+    price_names: List[str],      # subset of ['P_center','P_daily_mean']
+) -> Dict[str, Any]:
+    """
+    Builds regression matrix with:
+      • optional lag-1 daily mean ('P_daily_mean')
+      • optional 24-dim demeaned-target ('P_center_s{h}')
+      • per-horizon price-lags & DA-lags, interleaved by horizon
+      • weekday dummies (if wd != [0])
+      • fuel lags (once, at horizon 0)
+
+    Returns:
+      - regmat     : DataFrame (Days × Features)
+      - index_dict : {horizon → [col-index of P_center_s{h}]}
+      - dep_indices: list of those positions
+    """
+
+    # dims
+    n_days, S, _ = dat_eval.shape
+    price_idx    = reg_names.get_loc("Price")
+
+    # stack raw hourly prices: shape (Days, S)
+    prices = np.stack([dat_eval[:, h, price_idx] for h in range(S)], axis=1)
+
+    # today’s mean (for demean target) & lag-1 mean (for regressor)
+    today_mean = prices.mean(axis=1)
+    def lag_1d(x: np.ndarray, k: int) -> np.ndarray:
+        if k == 0: return x
+        return np.concatenate([np.full(k, np.nan), x[:-k]])
+    mean_lag1 = lag_1d(today_mean, 1)
+
+    # prepare the single-column daily-mean DF if requested
+    blocks: List[pd.DataFrame] = []
+    if "P_daily_mean" in price_names:
+        df_mean = pd.DataFrame(
+            {"P_daily_mean": mean_lag1},
+            index=days_eval
+        )
+        blocks.append(df_mean)
+
+    # build per-horizon blocks (interleaving P_center, price-lags, DA-lags)
+    per_list: List[pd.DataFrame] = []
+    for h in range(S):
+        spot_h = prices[:, h]
+        cols, data = [], []
+
+        # 1) demeaned target
+        if "P_center" in price_names:
+            cols.append(f"P_center_s{h}")
+            data.append(spot_h - today_mean)
+
+        # 2) price lags
+        for k in price_lags:
+            cols.append(f"Price_lag_{k}_s{h}")
+            data.append(lag_1d(spot_h, k))
+
+        # 3) DA lags
+        da_vals = dat_eval[:, h, reg_names.isin(da_names)]
+        for i, name in enumerate(da_names):
+            for k in da_lag:
+                cols.append(f"{name}_lag_{k}_s{h}")
+                data.append(lag_1d(da_vals[:, i], k))
+
+        # assemble this horizon’s DF
+        per_list.append(pd.DataFrame(
+            np.column_stack(data),
+            index=days_eval,
+            columns=cols
+        ))
+
+    # weekday dummies
+    if not (len(wd) == 1 and wd[0] == 0):
+        weekdays_num = days_eval.dt.weekday + 1
+        WD = np.column_stack([(weekdays_num == d).astype(int) for d in wd])
+        wd_df = pd.DataFrame(
+            WD, index=days_eval, columns=[f"WD_{d}" for d in wd]
+        )
+    else:
+        wd_df = pd.DataFrame(index=days_eval)
+
+    # fuel lags (horizon-0 representative)
+    fuel_vals = dat_eval[:, 0, reg_names.isin(fuel_names)]
+    fuel_block = np.concatenate([
+        lag_1d(fuel_vals[:, i], k).reshape(-1,1)
+        for k in fuel_lags for i in range(fuel_vals.shape[1])
+    ], axis=1)
+    fuel_cols = [f"{n}_lag_{k}" for k in fuel_lags for n in fuel_names]
+    fuel_df   = pd.DataFrame(fuel_block, index=days_eval, columns=fuel_cols)
+
+    # concatenate in the exact order we want:
+    blocks += per_list
+    if not wd_df.empty:    blocks.append(wd_df)
+    if not fuel_df.empty:  blocks.append(fuel_df)
+    regmat = pd.concat(blocks, axis=1)
+
+    # build index_dict & dep_indices for the P_center_s{h} targets
+    index_dict: Dict[int, List[int]] = {}
+    for h in range(S):
+        idx = regmat.columns.get_loc(f"P_center_s{h}")
+        index_dict[h] = [idx]
+    dep_indices = [index_dict[h][0] for h in range(S)]
+
+    return {
+        "regmat":      regmat,
+        "index_dict":  index_dict,
+        "dep_indices": dep_indices,
+    }
+
+
+# Prepare tensors for one forecast date                          
 def prepare_train_test_tensors(
     regmat_df: pd.DataFrame,
     dep_indices: List[int],
