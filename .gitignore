@@ -30,7 +30,6 @@ env/
 *.nbconvert.ipynb
 
 # Data files, logs, runtime
-*.csv
 *.h5
 *.db
 *.sqlite
