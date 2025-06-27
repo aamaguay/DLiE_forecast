@@ -12,6 +12,134 @@ import optuna
 
 #set the GPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def forecast_lgbm_whole_sample_LongShortTerm_w_Optuna_justTrainig(
+    Xy, feature_names_Xy, n_trials_lgbm=15, days_for_st_model = 14):
+
+    S = Xy.shape[1]  # 24 hours
+    T = Xy.shape[0]  # 731 days
+    Xy = Xy.reshape(-1, Xy.shape[-1]) 
+    # --- Clean NaNs ---
+    mask = ~torch.isnan(Xy).any(dim=1)
+    Xy = Xy[mask] 
+
+
+    n_total = Xy.shape[0]
+    last_day_indices = torch.arange(n_total - S, n_total, device=device)
+
+    mean = Xy[:-S].mean(dim=0)
+    std = Xy[:-S].std(dim=0)
+    std[std == 0] = 1
+    Xy_scaled = (Xy - mean) / std
+
+    forecast_x = Xy_scaled[last_day_indices, 1:]
+    train_mask = torch.ones(n_total, dtype=torch.bool, device=device)
+    train_mask[last_day_indices] = False
+
+    X_train = Xy_scaled[train_mask, 1:].cpu().numpy()
+    y_train = Xy_scaled[train_mask, 0].cpu().numpy()
+    x_pred = forecast_x.cpu().numpy()
+
+    def make_objective(X_train, y_train, X_val, y_val, feature_names_Xy):
+        def objective(trial):
+            params = {
+            "n_estimators": trial.suggest_int("n_estimators", 100, 500),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
+            "num_leaves": trial.suggest_int("num_leaves", 16, 128),
+            "max_depth": trial.suggest_int("max_depth", 3, 12),
+            "min_child_samples": trial.suggest_int("min_child_samples", 1, 30),
+            "subsample": trial.suggest_float("subsample", 0.7, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.7, 1.0),
+            "reg_alpha": trial.suggest_float("reg_alpha", 0.0, 2.0),
+            "reg_lambda": trial.suggest_float("reg_lambda", 0.0, 2.0),
+            "min_split_gain": trial.suggest_float("min_split_gain", 0.0, 0.05),
+            "force_row_wise": True,
+            "verbosity": -1
+            }
+
+            model = lgb.LGBMRegressor(**params)
+            model.fit(X_train, y_train)
+            x_pred_df = pd.DataFrame(X_val, columns=feature_names_Xy[1:])
+            preds = model.predict(x_pred_df)
+            return np.mean((preds - y_val) ** 2)
+        
+        return objective
+
+
+    # get hyper-parameteres for the long-term model
+    # Full size of 24 hours
+    val_horizon = S
+
+    # Define validation indices (penultimate day)
+    X_val = X_train[-(val_horizon * 2):]
+    y_val = y_train[-(val_horizon * 2):]
+
+    # Split for long-term model
+    X_long = X_train[:-(val_horizon * 2)]
+    y_long = y_train[:-(val_horizon * 2)]
+
+    days_for_st_model = days_for_st_model
+    # Split for short-term model
+    X_short = X_train[-(val_horizon * days_for_st_model):-(val_horizon * 2)]
+    y_short = y_train[-(val_horizon * days_for_st_model):-(val_horizon * 2)]
+
+    # early stopping criteria
+    early_stop = StopAfterBestStalls(patience=3, min_gain=0.001)
+
+    # Long-term Optuna
+    study_lg = optuna.create_study(direction="minimize")
+    study_lg.optimize(make_objective(X_long, y_long, X_val, y_val, feature_names_Xy), 
+                    n_trials=n_trials_lgbm, callbacks=[early_stop])
+    best_mse_lg = study_lg.best_value
+
+    # Short-term Optuna
+    study_st = optuna.create_study(direction="minimize")
+    study_st.optimize(make_objective(X_short, y_short, X_val, y_val, feature_names_Xy), 
+                    n_trials=n_trials_lgbm, callbacks=[early_stop])
+    best_mse_st = study_st.best_value
+    
+    # Final prediction using tuned long-term model
+    final_model_lg = lgb.LGBMRegressor(**study_lg.best_params)
+    final_model_lg.fit(np.concatenate([X_long, X_val]), np.concatenate([y_long, y_val]))
+
+    # Final prediction using tuned short-term model
+    final_model_st = lgb.LGBMRegressor(**study_st.best_params)
+    final_model_st.fit(np.concatenate([X_short, X_val]), np.concatenate([y_short, y_val]))
+
+    x_pred_df = pd.DataFrame(x_pred, columns=feature_names_Xy[1:])
+
+    def weighted_average_predictions(models, losses, x_pred_df):
+        inverse_losses = 1 / np.array(losses)
+        weights = inverse_losses / inverse_losses.sum()
+        preds = np.array([model.predict(x_pred_df) for model in models])
+        weighted_preds = np.average(preds, axis=0, weights=weights)
+        return weighted_preds
+    
+    lg_st_models, losses_lg_st = [final_model_lg, final_model_st], [best_mse_lg, best_mse_st]
+    y_pred = weighted_average_predictions(lg_st_models, losses_lg_st, x_pred_df)
+    y_pred = (y_pred * std[0].cpu().item()) + mean[0].cpu().item()
+
+    # feature importance
+    for idx,m in enumerate([final_model_lg, final_model_st]):
+        importances = m.feature_importances_
+        feature_importance_df = pd.DataFrame({
+            "feature": feature_names_Xy[1:],  # skip the raw "Price" if your model did
+            "importance": importances
+        })
+
+        # Sort by importance
+        feature_importance_df = feature_importance_df.sort_values(by="importance", ascending=False)
+
+        # Print
+        print('long model' if idx ==0  else 'short model', '************************')
+        print(feature_importance_df)
+
+    return {
+        "model": lg_st_models,
+        "n_features": X_train.shape[1],
+        "forecasts": torch.tensor(y_pred, dtype=torch.float32, device=device),
+        "losses": losses_lg_st
+    }
  
 def forecast_lgbm_whole_sample_justTrainig(Xy, feature_names_Xy):
     S = Xy.shape[1]  # 24 hours

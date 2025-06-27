@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from srs.models.gam import forecast_gam, forecast_gam_whole_sample, forecast_gam_whole_sample_justTrainig
 from srs.utils.tutor_utils import forecast_expert_ext, forecast_expert_ext_modifed
-from srs.models.light_gbm import forecast_lgbm_whole_sample, forecast_lgbm_whole_sample_LongShortTerm_w_Optuna, forecast_lgbm_whole_sample_optuna_selectBestOptions, forecast_lgbm_whole_sample_justTrainig
+from srs.models.light_gbm import forecast_lgbm_whole_sample, forecast_lgbm_whole_sample_LongShortTerm_w_Optuna, forecast_lgbm_whole_sample_optuna_selectBestOptions, forecast_lgbm_whole_sample_justTrainig, forecast_lgbm_whole_sample_w_Optuna, forecast_lgbm_whole_sample_LongShortTerm_w_Optuna_justTrainig
 
 #set the GPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -64,8 +64,7 @@ def get_holidays_dummy(dat, full_dates, holidays_ds, dayahead=1.5, daybefore=0.5
     
     return is_holiday.unsqueeze(1)
 
-
-def prepare_data_forTraining(dat, days, wd, price_s_lags, da_lag, reg_names, fuel_lags,
+def prepare_data_forTraining(ds_weather_zone, dat, days, wd, price_s_lags, da_lag, reg_names, fuel_lags, weather_lags,
                              full_dates, holidays_ds, model_first_diff_price = False, dayahead=1.5, daybefore=0.5):
     def get_lagged(Z, lag):
         if isinstance(Z, np.ndarray):
@@ -73,6 +72,16 @@ def prepare_data_forTraining(dat, days, wd, price_s_lags, da_lag, reg_names, fue
         if lag == 0:
             return Z
         return torch.cat([torch.full((lag,), float('nan'), device=Z.device), Z[:-lag]])
+    
+    def get_lagged_firstDiff(Z, lag):
+        if isinstance(Z, np.ndarray):
+            Z = torch.tensor(Z, dtype=torch.float32, device=device)
+        if lag == 0:
+            return Z
+        return torch.cat([
+            torch.full((lag,), float('nan'), device=Z.device),
+            Z[:-lag]
+        ])
 
     def get_lagged_2d(Z, lag):
         if isinstance(Z, np.ndarray):
@@ -107,6 +116,24 @@ def prepare_data_forTraining(dat, days, wd, price_s_lags, da_lag, reg_names, fue
             second_diff
         ])
         return second_diff
+    
+    reg_names = list(reg_names) + ds_weather_zone.columns.tolist()
+    # Make sure ds_weather_zone is sorted by time
+    ds_weather_zone = ds_weather_zone.sort_index()
+
+    # Convert DataFrame to numpy
+    weather_array = ds_weather_zone.to_numpy()  # Shape: (days * 24, weather_features)
+
+    # Reshape to 3D: (days, 24, weather_features)
+    n_hours_per_day = 24
+    n_days = weather_array.shape[0] // n_hours_per_day
+    n_weather_features = weather_array.shape[1]
+
+    weather_tensor = torch.tensor(
+        weather_array.reshape(n_days, n_hours_per_day, n_weather_features),
+        dtype=torch.float32,  # Or float64 if you use that
+        device=device
+    )
 
     S = dat.shape[1]  # 24 hours
     T = dat.shape[0]  # 731 days
@@ -128,13 +155,25 @@ def prepare_data_forTraining(dat, days, wd, price_s_lags, da_lag, reg_names, fue
     da_forecast_names = ["Load_DA", "Solar_DA", "WindOn_DA", "WindOff_DA"] 
     da_forecast_names = [da_forecast_names[0], da_forecast_names[2]]
     da_idx = torch.tensor([reg_names.index(name) for name in da_forecast_names], device=device)
+    weather_vars = ["Temp", "Solar", "WindS", "WindDir", "Press", "Humid"]
+    weather_idx = torch.tensor([reg_names.index(name) for name in weather_vars], device=device)
 
     # --- Flatten data ---
     flat_dat = dat.reshape(-1, dat.shape[2])  # shape (T*S, V)
+    weather_tensor = weather_tensor.reshape(-1, weather_tensor.shape[2]) 
+    flat_dat = torch.cat([flat_dat, weather_tensor], dim=1)
     price_series = flat_dat[:, price_idx]
 
-    # --- Feature Engineering ---
-    mat_price_lags = torch.stack([get_lagged(price_series, lag) for lag in price_s_lags], dim=1)
+    if model_first_diff_price:
+        price_diff_series_ = price_series[1:] - price_series[:-1]
+        price_diff_series_ = torch.cat([
+            torch.tensor([float('nan')], device=price_diff_series_.device),
+            price_diff_series_
+        ])
+        mat_price_lags = torch.stack([get_lagged_firstDiff(price_diff_series_, lag) for lag in price_s_lags], dim=1)
+    else:
+        mat_price_lags = torch.stack([get_lagged(price_series, lag) for lag in price_s_lags], dim=1)
+
 
     da_all = []
     for i in da_idx:
@@ -145,6 +184,9 @@ def prepare_data_forTraining(dat, days, wd, price_s_lags, da_lag, reg_names, fue
 
     mat_fuel_input = flat_dat[:, fuel_idx]
     mat_fuels = torch.cat([get_lagged_2d(mat_fuel_input, lag) for lag in fuel_lags], dim=1)
+
+    mat_weather_input = flat_dat[:, weather_idx]
+    mat_weather = torch.cat([get_lagged_2d(mat_weather_input, lag) for lag in weather_lags], dim=1)
 
     # volatility variables
     price_tensor = flat_dat[:, price_idx]
@@ -164,6 +206,22 @@ def prepare_data_forTraining(dat, days, wd, price_s_lags, da_lag, reg_names, fue
 
     sin_hour = torch.sin(hour_norm).unsqueeze(1)  # shape: (T*S, 1)
     cos_hour = torch.cos(hour_norm).unsqueeze(1)  # shape: (T*S, 1)
+
+    total_hours = S * T  # Total hourly points
+
+    # --- Weekly seasonality (168 hours cycle) ---
+    hour_indices = torch.arange(total_hours, device=device)
+    week_norm = 2 * torch.pi * hour_indices / (24 * 7)
+
+    sin_week = torch.sin(week_norm).unsqueeze(1)
+    cos_week = torch.cos(week_norm).unsqueeze(1)
+
+    # --- Yearly seasonality (8760 hours) ---
+    year_norm = 2 * torch.pi * hour_indices / (24 * 365)
+
+    sin_year = torch.sin(year_norm).unsqueeze(1)
+    cos_year = torch.cos(year_norm).unsqueeze(1)
+
 
     # here first difference
     if model_first_diff_price == True:
@@ -198,27 +256,33 @@ def prepare_data_forTraining(dat, days, wd, price_s_lags, da_lag, reg_names, fue
 
     # --- Create dummy variable for hour 7 or 8 AM ---
     hour_indices = torch.arange(S, device=device).repeat(T)  # shape: (T*S,)
-    hour_dummy = ((hour_indices >= 7) & (hour_indices <= 9) | 
-                   (hour_indices >= 17) & (hour_indices <= 19)).float().unsqueeze(1)  # shape: (T*S, 1)
+    hour_dummy_7to9_17to19 = ((hour_indices >= 7) & (hour_indices <= 9) | 
+                              (hour_indices >= 17) & (hour_indices <= 19)).float().unsqueeze(1)  # shape: (T*S, 1)
 
 
     # join all data
     Xy = torch.cat([price_series.unsqueeze(1), mat_price_lags, da_all_var, 
-                    WD_full, mat_fuels, extra_feats_tensor, hour_dummy,
+                    WD_full, mat_fuels, mat_weather,
+                    extra_feats_tensor,
                     sin_hour, cos_hour,
-                    volatility_feats,
-                    holiday_hour_dummy], dim=1)
-
+                    sin_week, cos_week, 
+                    sin_year, cos_year,
+                    volatility_feats], dim=1)
+    
     # --- feature names ----
-    # 1. Price feature
-    feature_names_Xy = ["Price"]
+    if model_first_diff_price == True:
+        # 1. Price feature
+        feature_names_Xy = ["deltaPrice"]
 
-    # --- feature names ----
-    # 1. Price feature
-    feature_names_Xy = ["Price"]
+        # 2. Price lags
+        feature_names_Xy += [f"deltaPrice_lag_{lag}" for lag in price_s_lags]
+    else:
+        # 1. Price feature
+        feature_names_Xy = ["Price"]
 
-    # 2. Price lags
-    feature_names_Xy += [f"Price_lag_{lag}" for lag in price_s_lags]
+        # 2. Price lags
+        feature_names_Xy += [f"Price_lag_{lag}" for lag in price_s_lags]
+
 
     # 3. DA features
     da_feature_names = [reg_names[i] for i in da_idx.cpu().numpy()]
@@ -234,17 +298,22 @@ def prepare_data_forTraining(dat, days, wd, price_s_lags, da_lag, reg_names, fue
     for fuel_name in fuel_feature_names:
         for lag in fuel_lags:
             feature_names_Xy.append(f"{fuel_name}_lag_{lag}")
+    
+    # 6. Weather features
+    weather_feature_names = [reg_names[i] for i in weather_idx.cpu().numpy()]
+    for w_name in weather_feature_names:
+        for lag in weather_lags:
+            feature_names_Xy.append(f"{w_name}_lag_{lag}")
 
     feature_names_Xy += [
     "pct_chg_Load_DA",
     "lag168_Load_DA",
     "lag1_price_2nd_diff",
-    "hour_7to9_17to18_dummy",
-    "sin_hour",     
-    "cos_hour",   
+    "sin_hour", "cos_hour", 
+    "sin_week", "cos_week",
+    "sin_year", "cos_year",  
     "volatility_24h_lg1",
-    "volatility_pct_24h_lg1",
-    "holiday_dummy"
+    "volatility_pct_24h_lg1"
     ]
     # --- ------ ----
     # Convert Xy to 3D: (days, hours, num_features)
@@ -253,6 +322,8 @@ def prepare_data_forTraining(dat, days, wd, price_s_lags, da_lag, reg_names, fue
     return(feature_names_Xy, Xy)
 
 def run_forecast_step_modified_JustTraining(
+    full_price_original,
+    full_price_first_lag,
     n,
     data_array,
     train_start_idx,
@@ -260,7 +331,9 @@ def run_forecast_step_modified_JustTraining(
     full_dates,
     feature_names, 
     ls_models,
-    apply_smoo_spline_over_varList
+    apply_smoo_spline_over_varList,
+    n_trials_lgbm,
+    days_for_st_model
 ):
     """
     n               : offset into the 2024 evaluation period
@@ -278,6 +351,8 @@ def run_forecast_step_modified_JustTraining(
     # slice out the training data & dates
     dat_slice = data_array[start_idx : (end_idx + 2)]
     days      = pd.Series(full_dates[start_idx : (end_idx + 2) ])  # <- here, if i use end_idx, it should be 2
+    full_price_original     =  full_price_original[start_idx : (end_idx + 2)].reshape(-1)
+    full_price_first_lag    =  full_price_first_lag[start_idx : (end_idx + 2)].reshape(-1)
     
     # # true price of the forecast day for evaluation
     # forecast_date_idx = end_idx + 1
@@ -294,18 +369,39 @@ def run_forecast_step_modified_JustTraining(
             # lg_gbm model forecast, 24h ahead
             lg_gbm_forecast = forecast_lgbm_whole_sample_justTrainig(
             dat_slice,
-            feature_names
+            feature_names,
+            full_price_original,
+            full_price_first_lag
             )["forecasts"]
             ls_results.append(lg_gbm_forecast)
         
         if md == "gam_24hAhead":
-            # lg_gbm model forecast, 24h ahead
-            lg_gbm_forecast = forecast_gam_whole_sample_justTrainig(
+            # gam model forecast, 24h ahead
+            lg_gam_forecast = forecast_gam_whole_sample_justTrainig(
             dat_slice,
             feature_names, 
             apply_smoo_spline_over_varList
             )["forecasts"]
-            ls_results.append(lg_gbm_forecast)
+            ls_results.append(lg_gam_forecast)
+
+        if md == "lgbm_24hAhead_withOptune":
+            # lg_gbm model forecast, 24h ahead
+            lg_gbm_forecast_wOpt = forecast_lgbm_whole_sample_w_Optuna(
+            dat_slice,
+            feature_names, 
+            n_trials_lgbm
+            )["forecasts"]
+            ls_results.append(lg_gbm_forecast_wOpt)
+
+        if md == "lgbm_24hAhead_LongShortTermWithOptune":
+            # lg_gbm model forecast, 24h ahead
+            lg_gbm_forecast_wOpt = forecast_lgbm_whole_sample_LongShortTerm_w_Optuna_justTrainig(
+            dat_slice,
+            feature_names, 
+            n_trials_lgbm,
+            days_for_st_model
+            )["forecasts"]
+            ls_results.append(lg_gbm_forecast_wOpt)
 
     print(f"-> finished loop {n}")
     return n, ls_results

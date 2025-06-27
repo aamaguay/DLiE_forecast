@@ -262,38 +262,14 @@ def forecast_gam_whole_sample_justTrainig(Xy, feature_names_Xy, apply_spline_ove
     
     # ft a gam
     gam = LinearGAM(terms).fit(X_train, y_train)
-    # print(gam.summary())
 
     # --- Predict and collect output ---
     y_pred = gam.predict(x_pred)
 
     y_pred = ( (y_pred) * std[0].cpu().item() ) + mean[0].cpu().item()
-    # print(y_pred)
 
-    # --- Save model coefficients ---
-    # Extract all coefficients and the mapping to features
     coef = gam.coef_
     term_features = gam.terms.feature  # array mapping each coef to a feature index (or None for intercept)
-
-    # # Group coefficients by feature
-    # coef_dict = defaultdict(list)
-    # for c, f in zip(coef, term_features):
-    #     if f is not None:
-    #         coef_dict[f].append(c)
-
-    # # Pad rows to same length
-    # max_len = max(len(v) for v in coef_dict.values())
-    # coef_matrix = np.array([
-    #     np.pad(v, (0, max_len - len(v)), constant_values=np.nan)
-    #     for k, v in sorted(coef_dict.items())
-    # ])
-
-    # # Assign feature names
-    # feature_names = ['Feature_' + str(i) for i in sorted(coef_dict.keys())]
-    # col_names = [f'coef_{j}' for j in range(max_len)]
-    # coefs_df = pd.DataFrame(coef_matrix, index=feature_names, columns=col_names)
-
-    # print(coefs_df)
 
     return {
     "statistics_": gam.statistics_,
