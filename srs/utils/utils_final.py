@@ -19,11 +19,6 @@ from torch import nn, optim
 from torch.utils.data import DataLoader, TensorDataset
 from typing import List, Dict, Any
 
-from srs.utils.our_utils import compute_hourly_delta, rolling_std_lag
-from srs.models.gam import forecast_gam, forecast_gam_whole_sample, forecast_gam_whole_sample_justTrainig
-#from srs.utils.tutor_utils import forecast_expert_ext, forecast_expert_ext_modifed
-from srs.models.light_gbm import forecast_lgbm_whole_sample, forecast_lgbm_whole_sample_LongShortTerm_w_Optuna, forecast_lgbm_whole_sample_optuna_selectBestOptions, forecast_lgbm_whole_sample_justTrainig
-
 #set the GPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

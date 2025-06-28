@@ -293,7 +293,6 @@ def build_mlp_rolling_forecasts_weighted_loss(
 
     return preds.cpu(), trues.cpu(), train_rmses, test_rmses
 
-
 def build_mlp_rolling_forecasts_weighted_data(
         regmat_df   : pd.DataFrame,
         dep_indices : List[int],
@@ -305,27 +304,44 @@ def build_mlp_rolling_forecasts_weighted_data(
         weight_decay: float,
         batch_size  : int,
         epochs      : int,
-        alpha       : float,                # time-decay weight
+        alpha       : float,
+        price_series_flat: np.ndarray,
         device      : torch.device | None = None,
 ):
-    device = device or torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu")
 
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # ------------------------------------------------------------------ data
     regmat  = torch.tensor(regmat_df.values, dtype=torch.float32, device=device)
     dep_var = regmat[:, dep_indices]
-    regmat[:, dep_indices] = 0
+    regmat[:, dep_indices] = 0          # remove target leakage
 
-    S      = dep_var.shape[1]
+    S = dep_var.shape[1]                # 24
+
+    total_days_full = price_series_flat.size // S
+    kept_days       = regmat.shape[0]   # after dropna
+    trim_hours      = (total_days_full - kept_days) * S
+
+    price_flat_trim = price_series_flat[trim_hours:]
+    price_prev_flat = np.concatenate(([np.nan], price_flat_trim[:-1]))
+    price_prev_2d   = torch.tensor(price_prev_flat.reshape(kept_days, S),
+                                   dtype=torch.float32, device=device)
+
     preds  = torch.empty((horizon, S), device=device)
     trues  = torch.empty((horizon, S), device=device)
-    train_rmses, test_rmses = [], []
 
-    w_full = torch.exp(-alpha * torch.arange(window-1, -1, -1, device=device))  
+    train_diff_rmses, test_diff_rmses = [], []
+    train_level_rmses, test_level_rmses = [], []
 
+    # time-decay row weights
+    w_full = torch.exp(-alpha * torch.arange(window-1, -1, -1, device=device)) \
+             if alpha != 0 else torch.ones(window, device=device)
+
+    # ------------------------------------------------------------------ horizon loop
     for n in range(horizon):
         idx = start_row + n
 
-        # standardise
+        # ----------- standardize X & y on current training window
         mean_x = regmat[idx-window:idx].mean(0, keepdim=True)
         std_x  = regmat[idx-window:idx].std(0, keepdim=True).clamp_min_(1e-9)
         X_train = (regmat[idx-window:idx] - mean_x) / std_x
@@ -336,48 +352,78 @@ def build_mlp_rolling_forecasts_weighted_data(
         y_train = (dep_var[idx-window:idx] - mean_y) / std_y
         y_true  = dep_var[idx].unsqueeze(0)
 
-        # apply weights to data (rows)
+        # ----------- weighted loader
         X_train_w = X_train * w_full.unsqueeze(1)
         y_train_w = y_train * w_full.unsqueeze(1)
 
         loader = DataLoader(
             TensorDataset(X_train_w, y_train_w),
-            batch_size=batch_size, shuffle=False, num_workers=0)
+            batch_size=batch_size, shuffle=False, num_workers=0
+        )
 
-        model = DeepMLP(input_dim=X_train.shape[1],
-                        hidden_dim=hidden_dim,
-                        output_dim=y_train.shape[1],
-                        n_hidden=2, dropout_p=0.10).to(device)
+        model = DeepMLP(
+            input_dim=X_train.shape[1],
+            hidden_dim=hidden_dim,
+            output_dim=y_train.shape[1],
+            n_hidden=2,
+            dropout_p=0.10
+        ).to(device)
 
-        opt = torch.optim.Adam(model.parameters(),
-                               lr=lr, weight_decay=weight_decay)
+        opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
         loss_fn = nn.MSELoss()
 
         for _ in range(epochs):
             model.train()
             for xb, yb in loader:
                 opt.zero_grad()
-                loss = loss_fn(model(xb), yb)     # plain MSE
-                loss.backward()
+                loss_fn(model(xb), yb).backward()
                 opt.step()
 
-        # forecast and evaluate
+        # ------------------------------------------------------------------ inference & metrics
         model.eval()
         with torch.no_grad():
+            # ---- Δ-RMSE ----------------------------------------------------
             pred_train_std = model(X_train_w)
-            resid_train    = pred_train_std - y_train_w
-            train_rmse_day = torch.sqrt((resid_train**2).mean()) * std_y.mean()
-            train_rmses.append(train_rmse_day.item())
+            pred_train     = pred_train_std * std_y + mean_y
+            y_true_train   = dep_var[idx-window:idx]
+            train_diff_rmses.append(
+                torch.sqrt(((pred_train - y_true_train) ** 2).mean()).item()
+            )
 
-            pred_std = model(X_test).squeeze(0)
-            pred     = pred_std * std_y + mean_y
-            test_rmses.append(torch.sqrt(((pred - y_true.squeeze(0))**2).mean()).item())
+            pred_test_std = model(X_test).squeeze(0)
+            pred_test     = (pred_test_std * std_y + mean_y).squeeze(0)
+            y_true_test   = y_true.squeeze(0)
+            test_diff_rmses.append(
+                torch.sqrt(((pred_test - y_true_test) ** 2).mean()).item()
+            )
 
-        preds[n] = pred
-        trues[n] = y_true.squeeze(0)
+            # ---- level-RMSE with hour-by-hour baseline --------------------
+            #   Training window: use price at t-1h for each timestamp
+            price_prev_train = price_prev_2d[idx-window:idx]          # (window, 24)
+            level_pred_train = price_prev_train + pred_train          # add Δ̂P
+            level_true_train = price_prev_train + y_true_train        # add ΔP
+            train_level_rmses.append(
+                torch.sqrt(((level_pred_train - level_true_train) ** 2).mean()).item()
+            )
 
-    return preds.cpu(), trues.cpu(), train_rmses, test_rmses
+            #   Test day
+            price_prev_day  = price_prev_2d[idx]                      # (24,)
+            level_pred_test = price_prev_day + pred_test
+            level_true_test = price_prev_day + y_true_test
+            test_level_rmses.append(
+                torch.sqrt(((level_pred_test - level_true_test) ** 2).mean()).item()
+            )
 
+            # ---- store preds / trues -------------------------------------
+            preds[n] = pred_test
+            trues[n] = y_true_test
+
+    return (preds.cpu(),
+            trues.cpu(),
+            train_diff_rmses,
+            test_diff_rmses,
+            train_level_rmses,
+            test_level_rmses)
 
 # Optuna tuning on evaluation block                            
 def tune_mlp_hyperparameters(
