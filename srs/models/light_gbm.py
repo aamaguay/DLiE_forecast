@@ -1,4 +1,5 @@
 # load packages
+import array
 import pandas as pd
 import numpy as np
 from sklearn.linear_model import LinearRegression
@@ -139,6 +140,94 @@ def forecast_lgbm_whole_sample_LongShortTerm_w_Optuna_justTrainig(
         "n_features": X_train.shape[1],
         "forecasts": torch.tensor(y_pred, dtype=torch.float32, device=device),
         "losses": losses_lg_st
+    }
+
+ 
+def forecast_lgbm_whole_sample_justTrainig(Xy, feature_names_Xy, 
+                                           full_price_original,
+                                           full_price_first_lag,
+                                           first_diff):
+    S = Xy.shape[1]  # 24 hours
+    T = Xy.shape[0]  # 731 days
+    Xy = Xy.reshape(-1, Xy.shape[-1]) 
+    # --- Clean NaNs ---
+    mask = ~torch.isnan(Xy).any(dim=1)
+    Xy = Xy[mask] 
+    full_price_original = full_price_original[mask]
+    full_price_first_lag = full_price_first_lag[mask]
+
+    # --- Split into train and forecast sets ---
+    n_total = Xy.shape[0]
+    last_day_indices = torch.arange(n_total - S, n_total, device=device)
+
+    # Normalize data
+    mean = Xy[:-S, :].mean(dim=0)
+    std = Xy[:-S, :].std(dim=0)
+    std[std == 0] = 1
+    Xy_scaled = (Xy - mean) / std
+
+    forecast_x = Xy_scaled[last_day_indices, 1:]
+    y_true_test = Xy_scaled[last_day_indices, 0].cpu().numpy()
+    train_mask = torch.ones(n_total, dtype=torch.bool, device=device)
+    train_mask[last_day_indices] = False
+
+    X_train = Xy_scaled[train_mask, 1:].cpu().numpy()
+    y_train = Xy_scaled[train_mask, 0].cpu().numpy()
+    x_pred = forecast_x.cpu().numpy()
+    x_pred = pd.DataFrame(x_pred, columns=feature_names_Xy[1:])
+
+    # --- Train LightGBM ---
+    lgb_model = lgb.LGBMRegressor(n_estimators=100, learning_rate=0.1)
+    lgb_model.fit(X_train, y_train)
+
+    # --- Predict and denormalize ---
+    y_pred_in_sample = lgb_model.predict(pd.DataFrame(X_train, columns=feature_names_Xy[1:]))
+
+    # print(np.mean(( np.array(y_train)  - y_pred_in_sample) ** 2).item())
+    
+    y_pred_in_sample = (y_pred_in_sample * std[0].cpu().item())+ mean[0].cpu().item()
+    y_pred_in_sample = torch.tensor(y_pred_in_sample, dtype=torch.float32, device=device)
+    if first_diff == True:
+        y_pred_in_sample = y_pred_in_sample + full_price_first_lag[train_mask]
+    yt_train_true = full_price_original[train_mask]
+    yt_train_true = yt_train_true.detach().clone().to(dtype=torch.float32, device=device)
+    y_train_ = (y_train * std[0].cpu().item())+ mean[0].cpu().item()
+
+    rmse_in_sample = torch.sqrt(torch.mean((y_pred_in_sample - yt_train_true) ** 2)).item()
+
+    y_pred = lgb_model.predict(x_pred)
+    y_pred = (y_pred * std[0].cpu().item()) + mean[0].cpu().item()
+    y_pred = torch.tensor(y_pred, dtype=torch.float32, device=device)
+    if first_diff == True:
+        y_pred_ = y_pred + full_price_first_lag[last_day_indices]
+    else:
+        y_pred_ = y_pred
+    y_true_test_ = (y_true_test * std[0].cpu().item())+ mean[0].cpu().item()
+    yt_ts_true = full_price_original[last_day_indices]
+    yt_ts_true = yt_ts_true.detach().clone().to(dtype=torch.float32, device=device)
+
+    rmse_test = torch.sqrt(torch.mean((yt_ts_true - y_pred_) ** 2)).item()
+
+
+    print(f"rmse in sample: {rmse_in_sample},....rmse in test: {rmse_test}")
+
+    importances = lgb_model.feature_importances_
+    feature_importance_df = pd.DataFrame({
+        "feature": feature_names_Xy[1:],  # skip the raw "Price" if your model did
+        "importance": importances
+    })
+
+    # Sort by importance
+    feature_importance_df = feature_importance_df.sort_values(by="importance", ascending=False)
+
+    # Print
+    print(feature_importance_df)
+
+    return {
+        "model": lgb_model,
+        "n_features": X_train.shape[1],
+        "forecasts": y_pred.detach().clone().to(dtype=torch.float32, device=device),
+        "rmse_in_sample": rmse_in_sample
     }
  
 def forecast_lgbm_whole_sample_justTrainig(Xy, feature_names_Xy):
@@ -844,3 +933,124 @@ def forecast_lgbm_whole_sample_optuna_selectBestOptions(
             "ls_models_lgm": ls_models_lgm
         }
 
+def forecast_lgbm_whole_sample_w_Optuna(
+    Xy, feature_names_X, full_price_original, full_price_first_lag, first_diff, n_trials_lgbm=15):
+    feature_names_Xy = feature_names_X
+    S = Xy.shape[1]  # 24 hours
+    T = Xy.shape[0]  # 731 days
+    Xy = Xy.reshape(-1, Xy.shape[-1]) 
+    mask = ~torch.isnan(Xy).any(dim=1)
+    Xy = Xy[mask]
+    full_price_original = full_price_original[mask]
+    full_price_first_lag = full_price_first_lag[mask]
+
+    n_total = Xy.shape[0]
+    last_day_indices = torch.arange(n_total - S, n_total, device=device)
+
+    mean = Xy[:-S].mean(dim=0)
+    std = Xy[:-S].std(dim=0)
+    std[std == 0] = 1
+    Xy_scaled = (Xy - mean) / std
+
+    forecast_x = Xy_scaled[last_day_indices, 1:]
+    train_mask = torch.ones(n_total, dtype=torch.bool, device=device)
+    train_mask[last_day_indices] = False
+
+    X_train = Xy_scaled[train_mask, 1:].cpu().numpy()
+    y_train = Xy_scaled[train_mask, 0].cpu().numpy()
+    x_pred = forecast_x.cpu().numpy()
+
+    def make_objective(X_train, y_train, X_val, y_val, feature_names_Xy):
+        def objective(trial):
+            params = {
+            "n_estimators": trial.suggest_int("n_estimators", 100, 500),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
+            "num_leaves": trial.suggest_int("num_leaves", 16, 128),
+            "max_depth": trial.suggest_int("max_depth", 3, 12),
+            "min_child_samples": trial.suggest_int("min_child_samples", 1, 30),
+            "subsample": trial.suggest_float("subsample", 0.7, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.7, 1.0),
+            "reg_alpha": trial.suggest_float("reg_alpha", 0.0, 2.0),
+            "reg_lambda": trial.suggest_float("reg_lambda", 0.0, 2.0),
+            "min_split_gain": trial.suggest_float("min_split_gain", 0.0, 0.05),
+            "force_row_wise": True,
+            "verbosity": -1
+            }
+
+            model = lgb.LGBMRegressor(**params)
+            model.fit(X_train, y_train)
+            x_pred_df = pd.DataFrame(X_val, columns=feature_names_Xy[1:])
+            preds = model.predict(x_pred_df)
+            return np.mean((preds - y_val) ** 2)
+        
+        return objective
+
+
+    # get hyper-parameteres for the long-term model
+    # Full size of 24 hours
+    val_horizon = S
+
+    # Define validation indices (penultimate day)
+    X_val = X_train[-(val_horizon * 2):]
+    y_val = y_train[-(val_horizon * 2):]
+
+    # Split for long-term model
+    X_long = X_train[:-(val_horizon * 2)]
+    y_long = y_train[:-(val_horizon * 2)]
+
+
+    # early stopping criteria
+    early_stop = StopAfterBestStalls(patience=3, min_gain=0.001)
+
+    # Long-term Optuna
+    study_lg = optuna.create_study(direction="minimize")
+    study_lg.optimize(make_objective(X_long, y_long, X_val, y_val, feature_names_Xy), 
+                    n_trials=n_trials_lgbm, callbacks=[early_stop])
+    best_mse_lg = study_lg.best_value
+    
+    # Final prediction using tuned long-term model
+    final_model_lg = lgb.LGBMRegressor(**study_lg.best_params)
+    final_model_lg.fit(np.concatenate([X_long, X_val]), np.concatenate([y_long, y_val]))
+
+    # get rsme for training
+    # --- Predict and denormalize ---
+    y_pred_in_sample = final_model_lg.predict(pd.DataFrame(X_train, columns=feature_names_Xy[1:]))
+    y_pred_in_sample = (y_pred_in_sample * std[0].cpu().item())+ mean[0].cpu().item()
+    y_pred_in_sample = torch.tensor(y_pred_in_sample, dtype=torch.float32, device=device)
+    if first_diff == True:
+        y_pred_in_sample = y_pred_in_sample + full_price_first_lag[train_mask]
+
+    yt_train_true = full_price_original[train_mask]
+    yt_train_true = yt_train_true.detach().clone().to(dtype=torch.float32, device=device)
+    y_train_ = (y_train * std[0].cpu().item())+ mean[0].cpu().item()
+    rmse_in_sample = torch.sqrt(torch.mean((y_pred_in_sample - yt_train_true) ** 2)).item()
+
+    x_pred_df = pd.DataFrame(x_pred, columns=feature_names_Xy[1:])
+    
+    preds = final_model_lg.predict(x_pred_df)
+    y_pred = (preds * std[0].cpu().item()) + mean[0].cpu().item()
+    y_pred = torch.tensor(y_pred, dtype=torch.float32, device=device)
+    if first_diff == True:
+        y_pred_ = y_pred + full_price_first_lag[last_day_indices]
+    else:
+        y_pred_ = y_pred
+    yt_ts_true = full_price_original[last_day_indices]
+    yt_ts_true = yt_ts_true.detach().clone().to(dtype=torch.float32, device=device)
+
+    rmse_test = torch.sqrt(torch.mean((yt_ts_true - y_pred_) ** 2)).item()
+
+    print(f"rmse in sample: {rmse_in_sample},....rmse in test: {rmse_test}")
+
+    def weighted_average_predictions(models, losses, x_pred_df):
+        inverse_losses = 1 / np.array(losses)
+        weights = inverse_losses / inverse_losses.sum()
+        preds = np.array([model.predict(x_pred_df) for model in models])
+        weighted_preds = np.average(preds, axis=0, weights=weights)
+        return weighted_preds
+    
+    
+    return {
+        "n_features": X_train.shape[1],
+        "forecasts": torch.tensor(y_pred, dtype=torch.float32, device=device), 
+        "rmse_in_sample": rmse_in_sample
+    }

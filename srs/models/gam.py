@@ -6,7 +6,7 @@ from scipy.stats import t
 from sklearn.linear_model import LinearRegression
 from calendar import day_abbr
 import torch
-from pygam import LinearGAM, s, l
+from pygam import LinearGAM, s, l, te
 from datetime import datetime
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -222,20 +222,41 @@ def forecast_gam_whole_sample(dat, days, wd, price_s_lags, da_lag, reg_names, fu
     "forecasts": torch.tensor(y_pred, dtype=torch.float32, device=device)
     }
 
-def forecast_gam_whole_sample_justTrainig(Xy, feature_names_Xy, apply_spline_over_varList):
-    def build_gam_terms(feature_names, apply_spline_over_varList):
+def forecast_gam_whole_sample_justTrainig(Xy, feature_names_Xy, apply_spline_over_varList,apply_cyclic_spline_over_varList,
+            apply_cubic_inter_over_varList, full_price_original,
+            full_price_first_lag, first_diff):
+    def build_gam_terms(feature_names, apply_smooth_list, apply_cyclic_list, apply_interactions):
         terms = None
+        name_to_idx = {name: idx for idx, name in enumerate(feature_names)}
+
         for idx, name in enumerate(feature_names):
-            term = s(idx) if name in apply_spline_over_varList else l(idx)
+            if name in apply_cyclic_list:
+                term = s(idx, basis='cp')  # cyclic cubic spline
+            elif name in apply_smooth_list:
+                term = s(idx, basis = 'ps')           # standard smooth spline
+            else:
+                term = l(idx)           # linear term
+
             terms = term if terms is None else terms + term
+
+        # Add interactions
+        if apply_interactions is not None:
+            for var1, var2 in apply_interactions:
+                if var1 in name_to_idx and var2 in name_to_idx:
+                    idx1, idx2 = name_to_idx[var1], name_to_idx[var2]
+                    terms += te(idx1, idx2)  # tensor-product interaction
+
         return terms
-    
+
     S = Xy.shape[1]  # 24 hours
     T = Xy.shape[0]  # 731 days
-    Xy = Xy.reshape(-1, Xy.shape[-1]) 
+    Xy = Xy.reshape(-1, Xy.shape[-1])
+
     # --- Split into training and prediction sets ---
     mask = ~torch.isnan(Xy).any(dim=1)
     Xy = Xy[mask]
+    full_price_original = full_price_original[mask]
+    full_price_first_lag = full_price_first_lag[mask]
 
     # Separate last 24 hours (forecast target)
     n_total = Xy.shape[0]
@@ -246,6 +267,7 @@ def forecast_gam_whole_sample_justTrainig(Xy, feature_names_Xy, apply_spline_ove
     std = Xy[:-S,:].std(dim=0)
     std[std == 0] = 1 # Prevent division by zero
     Xy_scaled = (Xy - mean) / std
+
           
 
     # Separate last 24 hours (forecast target)
@@ -258,21 +280,47 @@ def forecast_gam_whole_sample_justTrainig(Xy, feature_names_Xy, apply_spline_ove
     x_pred = forecast_x.cpu().numpy()
 
     # create s-terms
-    terms = build_gam_terms(feature_names_Xy[1:], apply_spline_over_varList)
+    terms = build_gam_terms(feature_names_Xy[1:], apply_spline_over_varList, apply_cyclic_spline_over_varList,
+            apply_cubic_inter_over_varList, )
     
     # ft a gam
     gam = LinearGAM(terms).fit(X_train, y_train)
 
+    # In trainig data set
+    # --- Predict and denormalize ---
+    y_pred_in_sample = gam.predict(pd.DataFrame(X_train, columns=feature_names_Xy[1:]))
+    
+    y_pred_in_sample = (y_pred_in_sample * std[0].cpu().item())+ mean[0].cpu().item()
+    y_pred_in_sample = torch.tensor(y_pred_in_sample, dtype=torch.float32, device=device)
+    if first_diff == True:
+        y_pred_in_sample = y_pred_in_sample + full_price_first_lag[train_mask]
+    yt_train_true = full_price_original[train_mask]
+    yt_train_true = yt_train_true.detach().clone().to(dtype=torch.float32, device=device)
+    rmse_in_sample = torch.sqrt(torch.mean(( y_pred_in_sample - yt_train_true) ** 2)).item()
+
+
     # --- Predict and collect output ---
     y_pred = gam.predict(x_pred)
-
     y_pred = ( (y_pred) * std[0].cpu().item() ) + mean[0].cpu().item()
+    y_pred = torch.tensor(y_pred, dtype=torch.float32, device=device)
 
+    if first_diff == True:
+        y_pred_ = y_pred + full_price_first_lag[last_day_indices]
+    else:
+        y_pred_ = y_pred
+
+    rmse_test = torch.sqrt(torch.mean(( ( full_price_original[last_day_indices]) - y_pred_ ) ** 2)).item()
+    print(f"mrse in sample: {rmse_in_sample},....rmse in test: {rmse_test}")
+    # print(y_pred)
+
+    # --- Save model coefficients ---
+    # Extract all coefficients and the mapping to features
     coef = gam.coef_
     term_features = gam.terms.feature  # array mapping each coef to a feature index (or None for intercept)
 
     return {
     "statistics_": gam.statistics_,
     "n_features": X_train.shape[1],
-    "forecasts": torch.tensor(y_pred, dtype=torch.float32, device=device)
+    "forecasts": torch.tensor(y_pred, dtype=torch.float32, device=device),
+    "rmse_in_sample": rmse_in_sample
     }
