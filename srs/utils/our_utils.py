@@ -64,8 +64,10 @@ def get_holidays_dummy(dat, full_dates, holidays_ds, dayahead=1.5, daybefore=0.5
     
     return is_holiday.unsqueeze(1)
 
-def prepare_data_forTraining(ds_weather_zone, dat, days, wd, price_s_lags, da_lag, reg_names, fuel_lags, weather_lags,
-                             full_dates, holidays_ds, model_first_diff_price = False, dayahead=1.5, daybefore=0.5):
+
+def prepare_data_forTraining(ds_weather_zone, dat, days, wd, price_s_lags, LOAD_DA_LAG, REST_DA_LAG, reg_names, fuel_lags, weather_lags, 
+                             holidays_ds, model_first_diff_price = False, dayahead=1.5, daybefore=0.5):
+    full_dates = days
     def get_lagged(Z, lag, lag_unit='hour', steps_per_day=24):
         if isinstance(Z, np.ndarray):
             Z = torch.tensor(Z, dtype=torch.float32, device=device)
@@ -178,6 +180,7 @@ def prepare_data_forTraining(ds_weather_zone, dat, days, wd, price_s_lags, da_la
     weekdays_num = torch.tensor(days.dt.weekday.values + 1, device=device)
     WD = torch.stack([(weekdays_num == x).float() for x in wd], dim=1)
     WD_full = WD.repeat_interleave(S, dim=0)
+    D_full = weekdays_num.repeat_interleave(S, dim=0)  
 
     # --- Indices ---
     reg_names = list(reg_names)
@@ -185,7 +188,7 @@ def prepare_data_forTraining(ds_weather_zone, dat, days, wd, price_s_lags, da_la
     fuel_names =  ["Coal", "NGas", "Oil", "EUA"] # ['NGas','Oil']
     fuel_idx = torch.tensor([reg_names.index(name) for name in fuel_names], device=device)
     da_forecast_names = ["Load_DA", "Solar_DA", "WindOn_DA", "WindOff_DA"] 
-    da_forecast_names = [da_forecast_names[0], da_forecast_names[2]]
+    # da_forecast_names = [da_forecast_names[0], da_forecast_names[2]]
     da_idx = torch.tensor([reg_names.index(name) for name in da_forecast_names], device=device)
     weather_vars = ["Temp", "Solar", "WindS", "WindDir", "Press", "Humid"]
     weather_idx = torch.tensor([reg_names.index(name) for name in weather_vars], device=device)
@@ -212,12 +215,21 @@ def prepare_data_forTraining(ds_weather_zone, dat, days, wd, price_s_lags, da_la
 
 
     da_all = []
-    for i in da_idx:
-        series = flat_dat[:, i].detach().clone()
+    for idx, var_name in zip(da_idx, da_forecast_names):
+        
+        series = flat_dat[:, idx].detach().clone()
+        
+        if var_name == 'Load_DA':
+            lags_to_apply = LOAD_DA_LAG
+        else:
+            lags_to_apply = REST_DA_LAG
+        
         lagged = torch.stack([
-            get_lagged(series, lag, lag_unit='day', steps_per_day=S) for lag in da_lag
-            ], dim=1)
+            get_lagged(series, lag, lag_unit='day', steps_per_day=S) for lag in lags_to_apply
+        ], dim=1)
+        
         da_all.append(lagged)
+
     da_all_var = torch.cat(da_all, dim=1)
 
     mat_fuel_input = flat_dat[:, fuel_idx]
@@ -296,13 +308,19 @@ def prepare_data_forTraining(ds_weather_zone, dat, days, wd, price_s_lags, da_la
 
 
     # join all data
+    # Xy = torch.cat([price_series.unsqueeze(1), mat_price_lags, da_all_var, WD_full,
+    #                 mat_fuels, mat_weather,
+    #                 extra_feats_tensor,
+    #                 sin_hour, cos_hour,
+    #                 sin_week, cos_week, 
+    #                 sin_year, cos_year,
+    #                 volatility_feats,
+    #                 D_full.unsqueeze(1)], dim=1)
+
     Xy = torch.cat([price_series.unsqueeze(1), mat_price_lags, da_all_var, WD_full,
-                    mat_fuels, mat_weather,
-                    extra_feats_tensor,
-                    sin_hour, cos_hour,
-                    sin_week, cos_week, 
-                    sin_year, cos_year,
-                    volatility_feats], dim=1)
+                    mat_fuels, mat_weather], dim=1)
+
+    
     
     # --- feature names ----
     if model_first_diff_price == True:
@@ -322,7 +340,12 @@ def prepare_data_forTraining(ds_weather_zone, dat, days, wd, price_s_lags, da_la
     # 3. DA features
     da_feature_names = [reg_names[i] for i in da_idx.cpu().numpy()]
     for da_name in da_feature_names:
-        for lag in da_lag:
+        if da_name == "Load_DA":
+            lags_to_use = LOAD_DA_LAG
+        else:
+            lags_to_use = REST_DA_LAG
+
+        for lag in lags_to_use:
             feature_names_Xy.append(f"{da_name}_lag_{lag}")
 
     # 4. Weekday dummy features
@@ -340,15 +363,16 @@ def prepare_data_forTraining(ds_weather_zone, dat, days, wd, price_s_lags, da_la
         for lag in weather_lags:
             feature_names_Xy.append(f"{w_name}_lag_{lag}")
 
-    feature_names_Xy += [
-    "pct_chg_Load_DA",
-    "lag168_Load_DA",
-    "sin_hour", "cos_hour", 
-    "sin_week", "cos_week",
-    "sin_year", "cos_year",  
-    "volatility_24h_lg1",
-    "volatility_pct_24h_lg1"
-    ]
+    # feature_names_Xy += [
+    # "pct_chg_Load_DA",
+    # "lag168_Load_DA",
+    # "sin_hour", "cos_hour", 
+    # "sin_week", "cos_week",
+    # "sin_year", "cos_year",  
+    # "volatility_24h_lg1",
+    # "volatility_pct_24h_lg1",
+    # "DoW"
+    # ]
     # --- ------ ----
     # Convert Xy to 3D: (days, hours, num_features)
     num_features = Xy.shape[1]
@@ -370,7 +394,8 @@ def run_forecast_step_modified_JustTraining(
     apply_cubic_inter_over_varList,
     n_trials_lgbm,
     days_for_st_model,
-    first_diff
+    first_diff,
+    EARLY_STOP
 ):
     """
     n               : offset into the 2024 evaluation period
@@ -434,7 +459,8 @@ def run_forecast_step_modified_JustTraining(
             full_price_original,
             full_price_first_lag,
             first_diff,
-            n_trials_lgbm
+            n_trials_lgbm,
+            EARLY_STOP
             )
             ls_results.append(lg_gbm_forecast_wOpt.get("forecasts"))
             ls_rmse_train.append(lg_gbm_forecast_wOpt.get("rmse_in_sample"))

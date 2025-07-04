@@ -934,7 +934,7 @@ def forecast_lgbm_whole_sample_optuna_selectBestOptions(
         }
 
 def forecast_lgbm_whole_sample_w_Optuna(
-    Xy, feature_names_X, full_price_original, full_price_first_lag, first_diff, n_trials_lgbm=15):
+    Xy, feature_names_X, full_price_original, full_price_first_lag, first_diff, n_trials_lgbm,EARLY_STOP ):
     feature_names_Xy = feature_names_X
     S = Xy.shape[1]  # 24 hours
     T = Xy.shape[0]  # 731 days
@@ -963,54 +963,71 @@ def forecast_lgbm_whole_sample_w_Optuna(
     def make_objective(X_train, y_train, X_val, y_val, feature_names_Xy):
         def objective(trial):
             params = {
-            "n_estimators": trial.suggest_int("n_estimators", 100, 500),
-            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
-            "num_leaves": trial.suggest_int("num_leaves", 16, 128),
-            "max_depth": trial.suggest_int("max_depth", 3, 12),
-            "min_child_samples": trial.suggest_int("min_child_samples", 1, 30),
+            "n_estimators": trial.suggest_int("n_estimators", 100, 600),
+            "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.04, log=True),
+            "num_leaves": trial.suggest_int("num_leaves", 16, 50 ),
+            "max_depth": trial.suggest_int("max_depth", 3, 8),
+            "min_child_samples": trial.suggest_int("min_child_samples", 30, 90),
             "subsample": trial.suggest_float("subsample", 0.7, 1.0),
             "colsample_bytree": trial.suggest_float("colsample_bytree", 0.7, 1.0),
-            "reg_alpha": trial.suggest_float("reg_alpha", 0.0, 2.0),
-            "reg_lambda": trial.suggest_float("reg_lambda", 0.0, 2.0),
-            "min_split_gain": trial.suggest_float("min_split_gain", 0.0, 0.05),
+            "reg_alpha": trial.suggest_float("reg_alpha", 0.0, 10.0),
+            "reg_lambda": trial.suggest_float("reg_lambda", 0.0, 10.0),
+            "min_split_gain": trial.suggest_float("min_split_gain", 0.0, 0.2),
             "force_row_wise": True,
             "verbosity": -1
             }
 
             model = lgb.LGBMRegressor(**params)
-            model.fit(X_train, y_train)
+            model.fit(X_train, y_train,
+                      eval_set=[(X_val, y_val)],
+                      eval_metric="rmse",
+                      callbacks=[lgb.early_stopping(50)])
+
             x_pred_df = pd.DataFrame(X_val, columns=feature_names_Xy[1:])
             preds = model.predict(x_pred_df)
-            return np.mean((preds - y_val) ** 2)
+            return np.sqrt(np.mean((preds - y_val) ** 2))
         
         return objective
 
 
     # get hyper-parameteres for the long-term model
     # Full size of 24 hours
-    val_horizon = S
+    val_horizon = S *4
 
     # Define validation indices (penultimate day)
-    X_val = X_train[-(val_horizon * 2):]
-    y_val = y_train[-(val_horizon * 2):]
+    X_val = X_train[-(val_horizon ):]
+    y_val = y_train[-(val_horizon ):]
 
     # Split for long-term model
-    X_long = X_train[:-(val_horizon * 2)]
-    y_long = y_train[:-(val_horizon * 2)]
+    X_long = X_train[:-(val_horizon * 4)]
+    y_long = y_train[:-(val_horizon * 4)]
 
 
     # early stopping criteria
-    early_stop = StopAfterBestStalls(patience=3, min_gain=0.001)
+    early_stop = StopAfterBestStalls(patience=EARLY_STOP, min_gain=0.001)
 
     # Long-term Optuna
     study_lg = optuna.create_study(direction="minimize")
     study_lg.optimize(make_objective(X_long, y_long, X_val, y_val, feature_names_Xy), 
                     n_trials=n_trials_lgbm, callbacks=[early_stop])
     best_mse_lg = study_lg.best_value
+
+    X_train_all = np.concatenate([X_long, X_val])
+    y_train_all = np.concatenate([y_long, y_val])
+
+    # Use last val_horizon for validation
+    X_train_final = X_train_all[:-val_horizon]
+    y_train_final = y_train_all[:-val_horizon]
+    X_val_final = X_train_all[-val_horizon:]
+    y_val_final = y_train_all[-val_horizon:]
     
     # Final prediction using tuned long-term model
     final_model_lg = lgb.LGBMRegressor(**study_lg.best_params)
-    final_model_lg.fit(np.concatenate([X_long, X_val]), np.concatenate([y_long, y_val]))
+    final_model_lg.fit(X_train_final, y_train_final,
+                       eval_set=[(X_val_final, y_val_final)],
+                       eval_metric="rmse",
+                       callbacks=[lgb.early_stopping(50)]
+                       )
 
     # get rsme for training
     # --- Predict and denormalize ---
